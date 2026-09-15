@@ -437,6 +437,9 @@ struct ZSTD_CCtx_params_s {
 
     /* Controls repcode search in external sequence parsing */
     ZSTD_ParamSwitch_e searchForExternalRepcodes;
+
+    /* GPU-accelerated match finder */
+    int gpuMatchFinder;  /* 0: disabled, 1: enabled */
 };  /* typedef'd to ZSTD_CCtx_params within "zstd.h" */
 
 #define COMPRESS_SEQUENCES_WORKSPACE_SIZE (sizeof(unsigned) * (MaxSeq + 2))
@@ -531,6 +534,9 @@ struct ZSTD_CCtx_s {
     ZSTD_localDict localDict;
     const ZSTD_CDict* cdict;
     ZSTD_prefixDict prefixDict;   /* single-usage dictionary */
+
+    /* GPU-accelerated match finder */
+    void* gpuMF;  /* ZSTD_GpuMatchFinder* - opaque handle */
 
     /* Multi-threading */
 #ifdef ZSTD_MULTITHREAD

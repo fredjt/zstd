@@ -94,7 +94,22 @@ typedef enum {
   ZSTD_error_srcBuffer_wrong     = 105,
   ZSTD_error_sequenceProducer_failed = 106,
   ZSTD_error_externalSequences_invalid = 107,
-  ZSTD_error_maxCode = 120  /* never EVER use this value directly, it can change in future versions! Use ZSTD_isError() instead */
+  /* GPU-accelerated match finder error codes (non-stable) */
+  ZSTD_error_GPU_invalidParameter = 110,
+  ZSTD_error_GPU_cudaNotAvailable = 111,
+  ZSTD_error_GPU_invalidHashLog = 112,
+  ZSTD_error_GPU_invalidChainLog = 113,
+  ZSTD_error_GPU_invalidSearchLog = 114,
+  ZSTD_error_GPU_invalidMinMatch = 115,
+  ZSTD_error_GPU_invalidSearchDepth = 116,
+  ZSTD_error_GPU_allocationFailed = 117,
+  ZSTD_error_GPU_cudaStreamCreationFailed = 118,
+  ZSTD_error_GPU_cudaAllocationFailed = 119,
+  ZSTD_error_GPU_matchFinder_notInitialized = 121,
+  ZSTD_error_GPU_cudaMemcpyFailed = 122,
+  ZSTD_error_GPU_kernelLaunchFailed = 123,
+  ZSTD_error_GPU_blockTooLarge = 124,
+  ZSTD_error_maxCode = 125  /* never EVER use this value directly, it can change in future versions! Use ZSTD_isError() instead */
 } ZSTD_ErrorCode;
 
 ZSTDERRORLIB_API const char* ZSTD_getErrorString(ZSTD_ErrorCode code);   /**< Same as ZSTD_getErrorName, but using a `ZSTD_ErrorCode` enum argument */

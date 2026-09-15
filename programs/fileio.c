@@ -45,6 +45,13 @@
 #include "fileio_asyncio.h"
 #include "fileio_common.h"
 
+/* Include internal header for ZSTD_cycleLog and other internal declarations */
+#include "../lib/compress/zstd_compress_internal.h"
+
+#ifdef ZSTD_CUDA
+#  include "../lib/compress/zstd_cuda_matchfinder.h"
+#endif
+
 FIO_display_prefs_t g_display_prefs = {2, FIO_ps_auto};
 UTIL_time_t g_displayClock = UTIL_TIME_INITIALIZER;
 
@@ -755,6 +762,11 @@ void FIO_setMMapDict(FIO_prefs_t* const prefs, ZSTD_ParamSwitch_e value)
     prefs->mmapDict = value;
 }
 
+void FIO_setGpuMode(FIO_prefs_t* const prefs, int value)
+{
+    prefs->gpuEnabled = value;
+}
+
 /* FIO_ctx_t functions */
 
 void FIO_setHasStdoutOutput(FIO_ctx_t* const fCtx, int value) {
@@ -1348,15 +1360,6 @@ typedef struct {
     FIO_SyncCompressIO io;
 } cRess_t;
 
-/** ZSTD_cycleLog() :
- *  condition for correct operation : hashLog > 1 */
-static U32 ZSTD_cycleLog(U32 hashLog, ZSTD_strategy strat)
-{
-    U32 const btScale = ((U32)strat >= (U32)ZSTD_btlazy2);
-    assert(hashLog > 1);
-    return hashLog - btScale;
-}
-
 static void FIO_adjustParamsForPatchFromMode(FIO_prefs_t* const prefs,
                                     ZSTD_compressionParameters* comprParams,
                                     unsigned long long const dictSize,
@@ -1471,6 +1474,18 @@ static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
         CHECK( ZSTD_CCtx_loadDictionary_byReference(ress.cctx, ress.dict.dictBuffer, ress.dict.dictBufferSize) );
     }
 
+    /* GPU-accelerated match finder */
+#ifdef ZSTD_CUDA
+    if (prefs->gpuEnabled) {
+        if (!ZSTD_cudaAvailable()) {
+            DISPLAYLEVEL(2, "Warning: CUDA not available, falling back to CPU match finder\n");
+        } else {
+            DISPLAYLEVEL(3, "Using GPU-accelerated match finder\n");
+            CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_gpuMatchFinder, 1) );
+        }
+    }
+#endif
+
     return ress;
 }
 
@@ -1478,6 +1493,12 @@ static void FIO_freeCResources(cRess_t* const ress)
 {
     FIO_freeDict(&(ress->dict));
     FIO_SyncCompressIO_destroy(&ress->io);
+#ifdef ZSTD_CUDA
+    if (ress->cctx && ress->cctx->gpuMF) {
+        ZSTD_freeGpuMatchFinder((ZSTD_GpuMatchFinder*)ress->cctx->gpuMF);
+        ress->cctx->gpuMF = NULL;
+    }
+#endif
     ZSTD_freeCStream(ress->cctx);   /* never fails */
 }
 

@@ -57,6 +57,17 @@ const char* ERR_getErrorString(ERR_enum code)
     case PREFIX(srcBuffer_wrong): return "Source buffer is wrong";
     case PREFIX(sequenceProducer_failed): return "Block-level external sequence producer returned an error code";
     case PREFIX(externalSequences_invalid): return "External sequences are not valid";
+    /* GPU-accelerated match finder error codes */
+    case PREFIX(GPU_invalidParameter): return "GPU match finder: invalid parameter";
+    case PREFIX(GPU_cudaNotAvailable): return "GPU match finder: CUDA not available";
+    case PREFIX(GPU_invalidHashLog): return "GPU match finder: invalid hash log";
+    case PREFIX(GPU_invalidChainLog): return "GPU match finder: invalid chain log";
+    case PREFIX(GPU_invalidSearchLog): return "GPU match finder: invalid search log";
+    case PREFIX(GPU_invalidMinMatch): return "GPU match finder: invalid min match";
+    case PREFIX(GPU_invalidSearchDepth): return "GPU match finder: invalid search depth";
+    case PREFIX(GPU_allocationFailed): return "GPU match finder: allocation failed";
+    case PREFIX(GPU_cudaStreamCreationFailed): return "GPU match finder: CUDA stream creation failed";
+    case PREFIX(GPU_cudaAllocationFailed): return "GPU match finder: CUDA allocation failed";
     case PREFIX(maxCode):
     default: return notErrorCode;
     }

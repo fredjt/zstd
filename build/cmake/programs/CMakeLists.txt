@@ -137,3 +137,16 @@ if (ZSTD_LZ4_SUPPORT)
         message(SEND_ERROR "lz4 library is missing")
     endif ()
 endif ()
+
+# Add GPU support
+if (ZSTD_BUILD_GPU)
+    set_property(TARGET zstd APPEND PROPERTY COMPILE_DEFINITIONS "ZSTD_CUDA")
+    # Add CUDA include path for programs
+    if (DEFINED ENV{CUDA_ROOT})
+        include_directories($ENV{CUDA_ROOT}/include)
+    elseif (EXISTS /usr/local/cuda/include)
+        include_directories(/usr/local/cuda/include)
+    elseif (EXISTS /opt/cuda/include)
+        include_directories(/opt/cuda/include)
+    endif()
+endif ()

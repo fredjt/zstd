@@ -70,6 +70,9 @@ typedef struct FIO_prefs_s {
     int allowBlockDevices;
     int passThrough;
     ZSTD_ParamSwitch_e mmapDict;
+
+    /* GPU-accelerated match finder */
+    int gpuEnabled;  /* 0: disabled, 1: enabled */
 } FIO_prefs_t;
 
 typedef enum {FIO_mallocDict, FIO_mmapDict} FIO_dictBufferType_t;

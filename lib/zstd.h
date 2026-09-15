@@ -538,7 +538,8 @@ typedef enum {
      ZSTD_c_experimentalParam17=1014,
      ZSTD_c_experimentalParam18=1015,
      ZSTD_c_experimentalParam19=1016,
-     ZSTD_c_experimentalParam20=1017
+     ZSTD_c_experimentalParam20=1017,
+     ZSTD_c_experimentalParam21=1018
 } ZSTD_cParameter;
 
 typedef struct {
@@ -1213,6 +1214,14 @@ ZSTDLIB_API size_t ZSTD_sizeof_DDict(const ZSTD_DDict* ddict);
 #if defined (__cplusplus)
 }
 #endif
+
+/* ZSTD_c_gpuMatchFinder
+ * Enable GPU-accelerated match finding.
+ * When enabled, the GPU match finder will be used for sequence generation
+ * if CUDA is available and the GPU context is properly initialized.
+ * Default: 0 (disabled).
+ */
+#define ZSTD_c_gpuMatchFinder ZSTD_c_experimentalParam21
 
 #endif  /* ZSTD_H_235446 */
 

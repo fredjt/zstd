@@ -66,6 +66,12 @@ CPPFLAGS_STATICLIB +=                  # static library build defaults to single
 # pkg-config Libs.private points to LDFLAGS_DYNLIB
 PCLIB := $(LDFLAGS_DYNLIB)
 
+# GPU (CUDA) support - add CUDA runtime library if enabled
+ifeq ($(ZSTD_CUDA), 1)
+  LDFLAGS_DYNLIB   += -lcudart
+  PCLIB += -lcudart
+endif
+
 ifeq ($(findstring GCC,$(CCVER)),GCC)
 decompress/zstd_decompress_block.o : CFLAGS+=-fno-tree-vectorize
 endif

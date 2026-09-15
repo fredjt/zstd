@@ -52,6 +52,11 @@ endif
 # Assembly support
 ZSTD_NO_ASM ?= 0
 
+# GPU (CUDA) support - optional
+# Set ZSTD_CUDA=1 to enable GPU-accelerated match finding
+# Requires nvcc (CUDA compiler) and CUDA runtime library
+ZSTD_CUDA ?= 0
+
 ZSTD_LIB_EXCLUDE_COMPRESSORS_DFAST_AND_UP ?= 0
 ZSTD_LIB_EXCLUDE_COMPRESSORS_GREEDY_AND_UP ?= 0
 
@@ -200,6 +205,79 @@ ifeq ($(shell test $(ZSTD_LEGACY_SUPPORT) -lt 8; echo $$?), 0)
   ZSTD_LEGACY_FILES += $(shell ls $(LIB_SRCDIR)/legacy/*.c | $(GREP) 'v0[$(ZSTD_LEGACY_SUPPORT)-7]')
 endif
 endif
+
+###############################################################
+# GPU (CUDA) support - optional
+###############################################################
+
+ZSTD_GPU_MATCH_FILES :=
+
+ifneq ($(ZSTD_CUDA), 0)
+  # Check for nvcc
+  NVCC := $(shell which nvcc 2>/dev/null)
+
+  ifneq ($(NVCC),)
+    # Check CUDA version by compiling a simple test
+    CUDA_AVAILABLE := $(shell echo "#include <cuda_runtime.h>" | $(NVCC) -x cu -c -o /dev/null - 2>/dev/null && echo 1 || echo 0)
+
+    ifeq ($(CUDA_AVAILABLE), 1)
+      # Found nvcc and CUDA headers - add GPU match finder files
+      ZSTD_GPU_MATCH_FILES := $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.cu
+
+      # Add CUDA include path and library
+      NVCCFLAGS += -I$(LIB_SRCDIR) -I$(LIB_SRCDIR)/common -I$(LIB_SRCDIR)/compress
+      NVCCFLAGS += -arch=sm_50 -Xcompiler "$(CFLAGS)"
+
+      # Detect CUDA runtime library location
+      CUDA_LIB_DIR := $(shell $(NVCC) --print-search-dirs 2>/dev/null | grep libraries | cut -d' ' -f2- | dirname)
+      ifeq ($(CUDA_LIB_DIR),)
+        # Try common locations
+        ifneq ($(wildcard /usr/local/cuda/lib64),)
+          CUDA_LIB_DIR := /usr/local/cuda/lib64
+        else ifneq ($(wildcard /usr/local/cuda/lib),)
+          CUDA_LIB_DIR := /usr/local/cuda/lib
+        else ifneq ($(wildcard /opt/cuda/lib64),)
+          CUDA_LIB_DIR := /opt/cuda/lib64
+        else
+          CUDA_LIB_DIR :=
+        endif
+      endif
+
+      ifneq ($(CUDA_LIB_DIR),)
+        NVCC_LDFLAGS += -L$(CUDA_LIB_DIR)
+        LDFLAGS += -L$(CUDA_LIB_DIR)
+        LDFLAGS += -lcudart
+      else
+        # Try standard locations
+        LDFLAGS += -lcudart
+      endif
+
+      # Add the .cu file to the build - it will be compiled by nvcc
+      # We need to handle .cu files specially in the Makefile
+      ZSTD_GPU_MATCH_OBJ := $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.o
+
+      # Rule to compile .cu file with nvcc
+      $(ZSTD_GPU_MATCH_OBJ): $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.cu
+		@echo "Compiling GPU match finder with nvcc"
+		$(Q)$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+      # Add the object file to the static library
+      ZSTD_STATICLIB_OBJ += $(ZSTD_GPU_MATCH_OBJ)
+
+      # Add the header to the public headers
+      ZSTD_COMPRESS_HEADERS += $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.h
+
+      $(info Building with GPU-accelerated match finding (CUDA))
+    else
+      $(info Warning: nvcc found but CUDA headers not available - GPU match finding disabled)
+      $(info Set ZSTD_CUDA=0 to suppress this warning)
+    endif
+  else
+    $(info Warning: nvcc not found - GPU match finding disabled)
+    $(info Install CUDA toolkit or set ZSTD_CUDA=0 to suppress this warning)
+  endif
+endif
+
 CPPFLAGS  += -DZSTD_LEGACY_SUPPORT=$(ZSTD_LEGACY_SUPPORT)
 
 # Include install_oses.mk from the same directory

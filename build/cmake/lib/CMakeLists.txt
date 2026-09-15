@@ -9,6 +9,7 @@
 
 project(libzstd C) # ASM language is conditionally enabled where supported
 
+cmake_policy(SET CMP0114 OLD)
 set(CMAKE_INCLUDE_CURRENT_DIR TRUE)
 option(ZSTD_BUILD_STATIC "BUILD STATIC LIBRARIES" ON)
 option(ZSTD_BUILD_SHARED "BUILD SHARED LIBRARIES" ON)
@@ -35,6 +36,8 @@ endif()
 
 file(GLOB CommonSources ${LIBRARY_DIR}/common/*.c)
 file(GLOB CompressSources ${LIBRARY_DIR}/compress/*.c)
+list(FILTER CompressSources EXCLUDE REGEX "zstd_cuda_matchfinder_wrapper\\.c$")
+list(FILTER CompressSources EXCLUDE REGEX "zstd_cuda_matchfinder\\.cu$")
 file(GLOB DecompressSources ${LIBRARY_DIR}/decompress/*.c)
 if (MSVC)
     add_compile_options(-DZSTD_DISABLE_ASM)
@@ -48,6 +51,55 @@ else ()
 endif ()
 file(GLOB DictBuilderSources ${LIBRARY_DIR}/dictBuilder/*.c)
 file(GLOB DeprecatedSources ${LIBRARY_DIR}/deprecated/*.c)
+
+# GPU (CUDA) support - optional
+option(ZSTD_BUILD_GPU "BUILD GPU-ACCELERATED MATCH FINDER (CUDA)" OFF)
+set(ZSTD_GPU_SOURCES "")
+set(ZSTD_GPU_LINK_LIBS "")
+
+if (ZSTD_BUILD_GPU)
+    find_package(CUDAToolkit QUIET)
+    if (CUDAToolkit_FOUND OR EXISTS "${CMAKE_CUDA_COMPILER}")
+        enable_language(CUDA)
+        if (NOT CUDAToolkit_FOUND)
+            find_package(CUDAToolkit REQUIRED)
+        endif()
+        message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
+        message(STATUS "Building with GPU-accelerated match finding (CUDA)")
+
+        # Set the GPU link library variable for static lib
+        set(ZSTD_GPU_LINK_LIBS zstd_gpu_shared)
+
+        # Build GPU code as a separate shared library (static libs can't link against cudart)
+        set(GPU_SOURCES
+            ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder_wrapper.c
+            ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder.cu
+        )
+        set_source_files_properties(${LIBRARY_DIR}/compress/zstd_cuda_matchfinder.cu PROPERTIES LANGUAGE CUDA)
+        set(CMAKE_CUDA_ARCHITECTURES "80;89;90")
+        
+        # Add wrapper to main library sources (not the .cu file)
+        list(APPEND ZSTD_GPU_SOURCES ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder_wrapper.c)
+        
+        # Build the CUDA runtime as a separate shared library
+        add_library(zstd_gpu_shared SHARED ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder.cu)
+        target_include_directories(zstd_gpu_shared PUBLIC $<BUILD_INTERFACE:${LIBRARY_DIR}>)
+        target_compile_definitions(zstd_gpu_shared PUBLIC ZSTD_CUDA)
+        # Use full path to cudart to avoid linker path issues on transitive deps
+        if(CUDA_cudart_LIBRARY)
+            set(CUDART_LIB ${CUDA_cudart_LIBRARY})
+        elseif(CUDA_CUDART)
+            set(CUDART_LIB ${CUDA_CUDART})
+        else()
+            set(CUDART_LIB cudart)
+        endif()
+        target_link_libraries(zstd_gpu_shared PUBLIC ${CUDART_LIB})
+        set_target_properties(zstd_gpu_shared PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    else()
+        message(STATUS "CUDA not found - GPU-accelerated match finding disabled")
+        set(ZSTD_BUILD_GPU OFF)
+    endif()
+endif()
 
 file(GLOB PublicHeaders ${LIBRARY_DIR}/*.h)
 file(GLOB CommonHeaders ${LIBRARY_DIR}/common/*.h)
@@ -73,6 +125,11 @@ endif()
 if (ZSTD_BUILD_DEPRECATED)
     set(Sources ${Sources} ${DeprecatedSources})
     set(Headers ${Headers} ${DeprecatedHeaders})
+endif()
+
+# Add GPU match finder sources if enabled
+if (ZSTD_BUILD_GPU AND ZSTD_GPU_SOURCES)
+    set(Sources ${Sources} ${ZSTD_GPU_SOURCES})
 endif()
 
 if (ZSTD_LEGACY_SUPPORT)
@@ -110,7 +167,12 @@ endif ()
 # __GNUC__ compatible compilers. Otherwise all the ASM code is disabled by
 # macros.
 if(NOT CMAKE_ASM_COMPILER STREQUAL CMAKE_C_COMPILER)
-    set_source_files_properties(${Sources} PROPERTIES LANGUAGE C)
+    # Exclude CUDA sources from the C language setting
+    set(C_SOURCES ${Sources})
+    if (ZSTD_BUILD_GPU AND ZSTD_GPU_SOURCES)
+        list(REMOVE_ITEM C_SOURCES ${ZSTD_GPU_SOURCES})
+    endif()
+    set_source_files_properties(${C_SOURCES} PROPERTIES LANGUAGE C)
 endif()
 
 macro (add_definition target var)
@@ -125,7 +187,19 @@ set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} /I \"${LIBRARY_DIR}\"")
 # Split project to static and shared libraries build
 if (ZSTD_BUILD_SHARED)
     add_library(libzstd_shared SHARED ${Sources} ${Headers} ${PlatformDependResources})
-    target_include_directories(libzstd_shared INTERFACE $<BUILD_INTERFACE:${PUBLIC_INCLUDE_DIRS}>)
+    target_include_directories(libzstd_shared PUBLIC $<BUILD_INTERFACE:${PUBLIC_INCLUDE_DIRS}>)
+    if (ZSTD_BUILD_GPU AND ZSTD_GPU_SOURCES)
+        target_compile_definitions(libzstd_shared PUBLIC ZSTD_CUDA)
+        target_link_libraries(libzstd_shared PRIVATE zstd_gpu_shared)
+        # Add CUDA include path for C files that include cuda_runtime.h
+        if (DEFINED ENV{CUDA_ROOT})
+            target_include_directories(libzstd_shared PUBLIC $<BUILD_INTERFACE:$ENV{CUDA_ROOT}/include>)
+        elseif (EXISTS /usr/local/cuda/include)
+            target_include_directories(libzstd_shared PUBLIC $<BUILD_INTERFACE:/usr/local/cuda/include>)
+        elseif (EXISTS /opt/cuda/include)
+            target_include_directories(libzstd_shared PUBLIC $<BUILD_INTERFACE:/opt/cuda/include>)
+        endif()
+    endif()
     if (ZSTD_MULTITHREAD_SUPPORT)
         target_compile_definitions(libzstd_shared PUBLIC ZSTD_MULTITHREAD)
         if (UNIX)
@@ -138,7 +212,19 @@ if (ZSTD_BUILD_SHARED)
 endif ()
 if (ZSTD_BUILD_STATIC)
     add_library(libzstd_static STATIC ${Sources} ${Headers})
-    target_include_directories(libzstd_static INTERFACE $<BUILD_INTERFACE:${PUBLIC_INCLUDE_DIRS}>)
+    target_include_directories(libzstd_static PUBLIC $<BUILD_INTERFACE:${PUBLIC_INCLUDE_DIRS}>)
+    if (ZSTD_BUILD_GPU AND ZSTD_GPU_SOURCES)
+        target_compile_definitions(libzstd_static PUBLIC ZSTD_CUDA)
+        target_link_libraries(libzstd_static PUBLIC ${ZSTD_GPU_LINK_LIBS})
+        # Add CUDA include path for C files that include cuda_runtime.h
+        if (DEFINED ENV{CUDA_ROOT})
+            target_include_directories(libzstd_static PUBLIC $<BUILD_INTERFACE:$ENV{CUDA_ROOT}/include>)
+        elseif (EXISTS /usr/local/cuda/include)
+            target_include_directories(libzstd_static PUBLIC $<BUILD_INTERFACE:/usr/local/cuda/include>)
+        elseif (EXISTS /opt/cuda/include)
+            target_include_directories(libzstd_static PUBLIC $<BUILD_INTERFACE:/opt/cuda/include>)
+        endif()
+    endif()
     if (ZSTD_MULTITHREAD_SUPPORT)
         target_compile_definitions(libzstd_static PUBLIC ZSTD_MULTITHREAD)
         if (UNIX)
@@ -267,6 +353,14 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/libzstd.pc" DESTINATION "${CMAKE_INST
 
 # install target
 install(FILES ${PublicHeaders} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+
+# Install the GPU shared library
+if (ZSTD_BUILD_GPU)
+    install(TARGETS zstd_gpu_shared
+        EXPORT "zstdExports"
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+endif()
 
 foreach(target_suffix IN ITEMS "_shared" "_static" "")
     if(TARGET "libzstd${target_suffix}")

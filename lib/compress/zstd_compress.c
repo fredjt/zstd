@@ -30,6 +30,9 @@
 #include "zstd_ldm.h"
 #include "zstd_compress_superblock.h"
 #include  "../common/bits.h"      /* ZSTD_highbit32, ZSTD_rotateRight_U64 */
+#ifdef ZSTD_CUDA
+#include "zstd_cuda_matchfinder.h"
+#endif
 
 /* ***************************************************************
 *  Tuning parameters
@@ -781,6 +784,7 @@ size_t ZSTD_CCtx_setParameter(ZSTD_CCtx* cctx, ZSTD_cParameter param, int value)
     case ZSTD_c_enableSeqProducerFallback:
     case ZSTD_c_maxBlockSize:
     case ZSTD_c_repcodeResolution:
+    case ZSTD_c_gpuMatchFinder:
         break;
 
     default: RETURN_ERROR(parameter_unsupported, "unknown parameter");
@@ -1036,6 +1040,10 @@ size_t ZSTD_CCtxParams_setParameter(ZSTD_CCtx_params* CCtxParams,
         BOUNDCHECK(ZSTD_c_repcodeResolution, value);
         CCtxParams->searchForExternalRepcodes = (ZSTD_ParamSwitch_e)value;
         return CCtxParams->searchForExternalRepcodes;
+
+    case ZSTD_c_gpuMatchFinder:
+        CCtxParams->gpuMatchFinder = (value != 0);
+        return CCtxParams->gpuMatchFinder;
 
     default: RETURN_ERROR(parameter_unsupported, "unknown parameter");
     }
@@ -2245,6 +2253,14 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
                 needsIndexReset,
                 ZSTD_resetTarget_CCtx), "");
 
+        /* GPU-accelerated match finder initialization */
+#ifdef ZSTD_CUDA
+        if (params->gpuMatchFinder && ZSTD_cudaAvailable() && !zc->gpuMF) {
+            DEBUGLOG(3, "Initializing GPU-accelerated match finder");
+            FORWARD_IF_ERROR(ZSTD_initGpuMatchFinderForCtx(zc), "");
+        }
+#endif
+
         zc->seqStore.sequencesStart = (SeqDef*)ZSTD_cwksp_reserve_aligned64(ws, maxNbSeq * sizeof(SeqDef));
 
         /* ldm hash table */
@@ -3295,6 +3311,13 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
     ZSTD_MatchState_t* const ms = &zc->blockState.matchState;
     DEBUGLOG(5, "ZSTD_buildSeqStore (srcSize=%zu)", srcSize);
     assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
+
+    /* GPU-accelerated match finding */
+#ifdef ZSTD_CUDA
+    if (zc->gpuMF && ZSTD_cudaAvailable()) {
+        return ZSTD_buildSeqStore_gpu(zc, src, srcSize);
+    }
+#endif
     /* Assert that we have correctly flushed the ctx params into the ms's copy */
     ZSTD_assertEqualCParams(zc->appliedParams.cParams, ms->cParams);
     /* TODO: See 3090. We reduced MIN_CBLOCK_SIZE from 3 to 2 so to compensate we are adding

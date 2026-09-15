@@ -93,6 +93,7 @@ static U32 g_ldmHashLog = 0;
 static U32 g_ldmMinMatch = 0;
 static U32 g_ldmHashRateLog = LDM_PARAM_DEFAULT;
 static U32 g_ldmBucketSizeLog = LDM_PARAM_DEFAULT;
+static int gpuEnabled = 0;
 
 
 #define DEFAULT_ACCEL 1
@@ -254,6 +255,9 @@ static void usageAdvanced(const char* programName)
     DISPLAYOUT("  --[no-]compress-literals      Force (un)compressed literals.\n");
     DISPLAYOUT("  --[no-]row-match-finder       Explicitly enable/disable the fast, row-based matchfinder for\n");
     DISPLAYOUT("                                the 'greedy', 'lazy', and 'lazy2' strategies.\n");
+#ifdef ZSTD_CUDA
+    DISPLAYOUT("  --gpu                         Use GPU-accelerated match finding (requires CUDA).\n");
+#endif
 
     DISPLAYOUT("\n");
     DISPLAYOUT("  --format=zstd                 Compress files to the `.zst` format. [Default]\n");
@@ -1025,6 +1029,7 @@ int main(int argCount, const char* argv[])
                 if (!strcmp(argument, "--adapt")) { adapt = 1; continue; }
                 if (!strcmp(argument, "--no-row-match-finder")) { useRowMatchFinder = ZSTD_ps_disable; continue; }
                 if (!strcmp(argument, "--row-match-finder")) { useRowMatchFinder = ZSTD_ps_enable; continue; }
+                if (!strcmp(argument, "--gpu")) { gpuEnabled = 1; continue; }
                 if (longCommandWArg(&argument, "--adapt=")) { adapt = 1; if (!parseAdaptParameters(argument, &adaptMin, &adaptMax)) { badUsage(programName, originalArgument); CLEAN_RETURN(1); } continue; }
                 if (!strcmp(argument, "--single-thread")) { nbWorkers = 0; singleThread = 1; continue; }
                 if (!strcmp(argument, "--format=zstd")) { suffix = ZSTD_EXTENSION; cType = FIO_zstdCompression; continue; }
@@ -1196,6 +1201,8 @@ int main(int argCount, const char* argv[])
                     UTIL_refFilename(file_of_names, listName);
                     continue;
                 }
+
+                if (!strcmp(argument, "--gpu")) { gpuEnabled = 1; continue; }
 
                 badUsage(programName, originalArgument);
                 CLEAN_RETURN(1);
@@ -1630,6 +1637,7 @@ int main(int argCount, const char* argv[])
         if (g_ldmHashRateLog != LDM_PARAM_DEFAULT) FIO_setLdmHashRateLog(prefs, (int)g_ldmHashRateLog);
         FIO_setAdaptiveMode(prefs, adapt);
         FIO_setUseRowMatchFinder(prefs, (int)useRowMatchFinder);
+        FIO_setGpuMode(prefs, gpuEnabled);
         FIO_setAdaptMin(prefs, adaptMin);
         FIO_setAdaptMax(prefs, adaptMax);
         FIO_setRsyncable(prefs, rsyncable);
