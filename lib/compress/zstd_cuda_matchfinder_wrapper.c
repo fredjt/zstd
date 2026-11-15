@@ -153,8 +153,28 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
     for (i = 0; i < nbSeq; i++)
     {
         SeqDef* const seq = zc->seqStore.sequences + i;
+        /* Long-length tracking, exactly like the CPU ZSTD_storeSeqOnly() :
+         * a match longer than 65535 + MINMATCH (or a literal run longer than
+         * 65535) does not fit in the U16 field. The encoder recovers the full
+         * length from longLengthPos/longLengthType. A block is at most 128 KB
+         * and matches are non-overlapping, so at most one long length exists. */
+        if (seqs[i].litLength > 0xFFFF)
+        {
+            assert(zc->seqStore.longLengthType == ZSTD_llt_none);
+            zc->seqStore.longLengthType = ZSTD_llt_literalLength;
+            zc->seqStore.longLengthPos = (U32) i;
+        }
         seq->litLength = (U16) seqs[i].litLength;
-        seq->mlBase = (U16) (seqs[i].matchLength - MINMATCH);
+        {
+            size_t const mlBase = seqs[i].matchLength - MINMATCH;
+            if (mlBase > 0xFFFF)
+            {
+                assert(zc->seqStore.longLengthType == ZSTD_llt_none);
+                zc->seqStore.longLengthType = ZSTD_llt_matchLength;
+                zc->seqStore.longLengthPos = (U32) i;
+            }
+            seq->mlBase = (U16) mlBase;
+        }
         /* GPU stores raw offset (distance); zstd format requires offBase = offset + ZSTD_REP_NUM */
         seq->offBase = seqs[i].offset + ZSTD_REP_NUM;
     }

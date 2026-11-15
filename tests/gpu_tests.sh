@@ -11,7 +11,7 @@
 
 set -u
 
-ZSTD_BIN="${ZSTD_BIN:-../../programs/zstd}"
+ZSTD_BIN="${ZSTD_BIN:-../programs/zstd}"
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT INT TERM
 

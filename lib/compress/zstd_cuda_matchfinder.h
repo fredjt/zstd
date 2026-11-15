@@ -81,21 +81,32 @@ struct ZSTD_GpuMatchFinder_s {
     ZSTD_GpuCompressionParameters params;
     size_t windowSize;
     size_t hashTableSize;
-    size_t chainTableSize;
     int initialized;
 
     /* CUDA resources */
 #ifdef ZSTD_CUDA
     unsigned char* d_window;          /**< Device pointer to sliding window */
-    unsigned* d_hashTable;            /**< Device pointer to hash table */
-    unsigned* d_chainTable;           /**< Device pointer to chain table */
-    ZSTD_GpuMatchResult* d_results;   /**< Device pointer to match results */
+    void* d_keyA;                     /**< Composite sort keys (fill buffer) */
+    void* d_keyB;                     /**< Sort ping-pong buffer (final result after odd passes) */
+    void* d_slot;                     /**< position -> index in sorted array */
+    unsigned* d_rowStart;             /**< CSR row start index per hash */
+    unsigned* d_rowEnd;               /**< CSR row end index per hash */
+    void* d_cand;                     /**< Device candidates [counter, per-position...] */
+    void* d_blockHist;                /**< Radix per-block histogram (512x256x4 B) */
+    void* d_digitStart;               /**< Radix per-digit global starts (256x4 B) */
+    void* cand_host;                  /**< Pinned host mirror of d_cand */
     cudaStream_t stream;              /**< CUDA stream handle */
 #else
     void* d_window;                   /**< Placeholder for CUDA pointer */
-    void* d_hashTable;
-    void* d_chainTable;
-    void* d_results;
+    void* d_keyA;
+    void* d_keyB;
+    void* d_slot;
+    void* d_rowStart;
+    void* d_rowEnd;
+    void* d_cand;
+    void* d_blockHist;
+    void* d_digitStart;
+    void* cand_host;
     void* stream;
 #endif
 
@@ -159,6 +170,8 @@ size_t ZSTD_estimateGpuMatchFinderMemory(
  * @param prevRep Repetition codes from the previous block
  * @return Number of sequences written, or error code
  */
+/* The GPU path never emits repcodes : both rep arrays are passed through
+ * unchanged (all zero). */
 size_t ZSTD_compressBlock_gpu(
     ZSTD_GpuMatchFinder* gpuMF,
     ZSTD_Sequence* dst,
@@ -166,7 +179,7 @@ size_t ZSTD_compressBlock_gpu(
     void const* src,
     size_t srcSize,
     unsigned rep[ZSTD_REP_NUM],
-    unsigned const prevRep[ZSTD_REP_NUM]);
+    unsigned repOut[ZSTD_REP_NUM]);
 
 /**
  * Check if GPU match finding should be used for this context.
@@ -181,35 +194,6 @@ int ZSTD_shouldUseGpu(ZSTD_CCtx const* zc);
  */
 size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, size_t srcSize);
 
-/* ======================================================================== */
-/* Internal Functions (defined in .cu file)                                   */
-/* ======================================================================== */
-
-/**
- * Launch GPU match finder kernel.
- * @param gpuMF The GPU match finder context
- * @param src Input data
- * @param srcSize Size of input data
- * @return 0 on success, error code on failure
- */
-size_t ZSTD_launchGpuMatchFinder(
-    ZSTD_GpuMatchFinder* gpuMF,
-    void const* src,
-    size_t srcSize);
-
-/**
- * Copy GPU match results from device to host.
- * @param gpuMF The GPU match finder context
- * @param dst Destination buffer for results
- * @param dstCapacity Capacity of destination buffer
- * @param rep Repetition codes
- * @return Number of sequences, or error code
- */
-size_t ZSTD_copyGpuMatchResults(
-    ZSTD_GpuMatchFinder* gpuMF,
-    SeqDef* dst,
-    size_t dstCapacity,
-    unsigned rep[ZSTD_REP_NUM]);
 
 #ifdef __cplusplus
 }

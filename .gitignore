@@ -63,3 +63,9 @@ compile_commands.json
 .clangd
 perf.data
 perf.data.old
+
+# Local gh & git state (HOME is this repo dir in the sandbox)
+.config/gh/
+.local/state/gh/
+.cache/
+.gitconfig

@@ -3260,9 +3260,16 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
     DEBUGLOG(5, "ZSTD_buildSeqStore (srcSize=%zu)", srcSize);
     assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
 
-    /* GPU-accelerated match finding */
+    /* GPU-accelerated match finding (POC scope : ZSTD_fast strategy only,
+     * i.e. the default level-1 class. The other strategies - dfast, which is
+     * the default at levels 2-3, and greedy/lazy/bt - keep their own table
+     * semantics (8-byte checks, stepped search, backward extension, lazy
+     * lookahead) and stay on the CPU. A --gpu context compresses with the
+     * fast strategy when the selected strategy is fast, and with the
+     * requested strategy on the CPU otherwise. See the design note in
+     * doc/gpu_matchfinding_design.md for the tradeoffs. ) */
 #ifdef ZSTD_CUDA
-    if (zc->gpuMF && ZSTD_cudaAvailable()) {
+    if (zc->gpuMF && ZSTD_cudaAvailable() && zc->appliedParams.cParams.strategy == ZSTD_fast) {
         return ZSTD_buildSeqStore_gpu(zc, src, srcSize);
     }
 #endif
