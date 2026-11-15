@@ -45,6 +45,11 @@ static void ZSTD_storeLastLiterals_gpu(SeqStore_t* seqStorePtr, const BYTE* anch
  * Initialize the GPU match finder from CCtx parameters.
  * Called when GPU mode is first requested.
  */
+/* POC scope (G8) : at most one GPU match finder per process - enforced by
+ * the reference count in ZSTD_createGpuMatchFinder (.cu), which fails here
+ * with an allocation error when another context already owns the GPU. The
+ * caller (zstd_compress.c) turns that into a one-time warning plus the CPU
+ * match finder. */
 size_t ZSTD_initGpuMatchFinderForCtx(ZSTD_CCtx* zc)
 {
     ZSTD_GpuCompressionParameters gpuParams = {0};

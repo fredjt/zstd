@@ -597,6 +597,14 @@ static size_t ZSTD_runGpuMatchFinding(
 /* API : create / free / estimate                                            */
 /* ======================================================================== */
 
+/* POC scope (G8) : at most one GPU match finder per process. Each owns a
+ * device window plus the sort/slot buffers (a few MB at 128 KB blocks), so
+ * multi-threaded workers sharing a process must not each allocate one. The
+ * counter is a reference count : it drops when the owning context frees its
+ * match finder, so a later context can take the GPU over again. Single-
+ * threaded POC : volatile, not a lock. */
+static volatile int g_gpuMFCount = 0;
+
 size_t ZSTD_createGpuMatchFinder(ZSTD_GpuMatchFinder** gpuMF, const ZSTD_GpuCompressionParameters* cParams,
                                  const size_t srcSize)
 {
@@ -604,6 +612,13 @@ size_t ZSTD_createGpuMatchFinder(ZSTD_GpuMatchFinder** gpuMF, const ZSTD_GpuComp
 
     ZSTD_GpuMatchFinder* ctx = (ZSTD_GpuMatchFinder*) malloc(sizeof(ZSTD_GpuMatchFinder));
     if (!ctx) return ERROR(GPU_allocationFailed);
+
+    if (g_gpuMFCount >= 1) {
+        /* GPU match finder already in use by another context in this
+         * process : the caller falls back to the CPU match finder. */
+        free(ctx);
+        return ERROR(GPU_cudaAllocationFailed);
+    }
 
     memset(ctx, 0, sizeof(ZSTD_GpuMatchFinder));
     ctx->params = *cParams;
@@ -684,6 +699,7 @@ size_t ZSTD_createGpuMatchFinder(ZSTD_GpuMatchFinder** gpuMF, const ZSTD_GpuComp
     }
 
     *gpuMF = ctx;
+    g_gpuMFCount++;
     return 0;
 }
 
@@ -706,6 +722,7 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
     cudaFreeHost(gpuMF->cand_host);
     if (gpuMF->h_results) cudaFreeHost(gpuMF->h_results);
 
+    if (g_gpuMFCount > 0) g_gpuMFCount--;
     free(gpuMF);
     return 0;
 }

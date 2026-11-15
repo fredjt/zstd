@@ -13,6 +13,7 @@
 ***************************************/
 #include "../common/allocations.h"  /* ZSTD_customMalloc, ZSTD_customCalloc, ZSTD_customFree */
 #include "../common/zstd_deps.h"  /* INT_MAX, ZSTD_memset, ZSTD_memcpy */
+#include <stdio.h>  /* stderr : one-time --gpu fallback warnings (G8) */
 #include "../common/bmi2.h"
 #include "../common/mem.h"
 #include "../common/error_private.h"
@@ -189,6 +190,15 @@ static void ZSTD_freeCCtxContent(ZSTD_CCtx* cctx)
     assert(cctx->staticSize == 0);
 #ifdef ZSTD_MULTITHREAD
     ZSTDMT_freeCCtx(cctx->mtctx); cctx->mtctx = NULL;  /* pending jobs may use the dictionary */
+#endif
+    /* GPU match finder : the library owns it (the CLI FIO layer NULLs
+     * cctx->gpuMF after freeing it itself, so this stays a no-op there).
+     * G8 : no per-context device-memory leak on ZSTD_freeCCtx. */
+#ifdef ZSTD_CUDA
+    if (cctx->gpuMF) {
+        ZSTD_freeGpuMatchFinder((ZSTD_GpuMatchFinder*) cctx->gpuMF);
+        cctx->gpuMF = NULL;
+    }
 #endif
     ZSTD_clearAllDicts(cctx);
     ZSTD_cwksp_free(&cctx->workspace, cctx->customMem);
@@ -2283,11 +2293,25 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
                 needsIndexReset,
                 ZSTD_resetTarget_CCtx), "");
 
-        /* GPU-accelerated match finder initialization */
+        /* GPU-accelerated match finder initialization.
+         * POC contract (G8) : --gpu is never a hard error. Without a CUDA
+         * device, or when the GPU match finder fails to initialize (device
+         * memory allocation, process-wide context cap), the context quietly
+         * stays on the CPU match finder and a one-time warning goes to
+         * stderr. zc->gpuMF == NULL selects the CPU path per block. */
 #ifdef ZSTD_CUDA
-        if (params->gpuMatchFinder && ZSTD_cudaAvailable() && !zc->gpuMF) {
-            DEBUGLOG(3, "Initializing GPU-accelerated match finder");
-            FORWARD_IF_ERROR(ZSTD_initGpuMatchFinderForCtx(zc), "");
+        if (params->gpuMatchFinder && !zc->gpuMF) {
+            static int gpuWarned = 0;
+            if (ZSTD_cudaAvailable()) {
+                size_t const gpuErr = ZSTD_initGpuMatchFinderForCtx(zc);
+                if (ZSTD_isError(gpuErr) && !gpuWarned) {
+                    fprintf(stderr, "zstd: GPU match finder initialization failed; using the CPU match finder.\n");
+                    gpuWarned = 1;
+                }
+            } else if (!gpuWarned) {
+                fprintf(stderr, "zstd: --gpu requested but no CUDA device is available; using the CPU match finder.\n");
+                gpuWarned = 1;
+            }
         }
 #endif
 
