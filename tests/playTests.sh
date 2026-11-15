@@ -1998,4 +1998,7 @@ zstd -T0 --train-cover "$TESTDIR"/*.c "$PRGDIR"/*.c
 test -f dictionary
 rm -f tmp* dictionary
 
+# GPU match-finding correctness suite (skips itself when no CUDA build / no GPU)
+sh gpu_tests.sh || die "GPU match-finding tests failed"
+
 rm -f tmp*

@@ -150,7 +150,11 @@ endif
 GREP = grep $(GREP_OPTIONS)
 
 ZSTD_COMMON_FILES := $(sort $(wildcard $(LIB_SRCDIR)/common/*.c))
-ZSTD_COMPRESS_FILES := $(sort $(wildcard $(LIB_SRCDIR)/compress/*.c))
+# The CUDA wrapper is excluded from the source list by default.
+# It is only added back in the GPU section below when a working CUDA
+# toolchain is detected; leaving it in the list would break plain
+# (non-CUDA) program builds at link time.
+ZSTD_COMPRESS_FILES := $(filter-out $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder_wrapper.c, $(sort $(wildcard $(LIB_SRCDIR)/compress/*.c)))
 ZSTD_DECOMPRESS_FILES := $(sort $(wildcard $(LIB_SRCDIR)/decompress/*.c))
 ZSTD_DICTBUILDER_FILES := $(sort $(wildcard $(LIB_SRCDIR)/dictBuilder/*.c))
 ZSTD_DEPRECATED_FILES := $(sort $(wildcard $(LIB_SRCDIR)/deprecated/*.c))
@@ -225,6 +229,8 @@ ifneq ($(ZSTD_CUDA), 0)
     ifeq ($(CUDA_AVAILABLE), 1)
       # Found nvcc and CUDA headers - add GPU match finder files
       ZSTD_GPU_MATCH_FILES := $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.cu
+      # Add the C wrapper to the source list (excluded by default above)
+      ZSTD_COMPRESS_FILES += $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder_wrapper.c
 
       # Add CUDA include path and library
       NVCCFLAGS += -I$(LIB_SRCDIR) -I$(LIB_SRCDIR)/common -I$(LIB_SRCDIR)/compress

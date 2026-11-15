@@ -362,19 +362,21 @@ static size_t ZSTD_runGpuMatchFinding(
     unsigned const chainLog = gpuMF->params.chainLog;
     unsigned const searchLog = gpuMF->params.searchLog;
     unsigned const minMatch = gpuMF->params.minMatch;
-    /* Compute window log from srcSize: use enough bits to cover srcSize */
-    /* In zstd, windowLog determines max match distance. For a single block,
-     * we need at least log2(srcSize) to find all matches within the block. */
-    unsigned windowLog = 15; /* default 32KB */
+    /* Enforce the CCtx compression window : the maximum match distance is
+     * windowSize (set by the wrapper from zc->appliedParams.cParams.windowSize),
+     * not a value derived from srcSize. Matches beyond the window would make
+     * the frame undecodable. Falls back to the srcSize-derived value if the
+     * window was not set. */
+    unsigned windowLog = 0;
     {
-        size_t s = srcSize;
+        size_t const w = (gpuMF->windowSize > 0) ? gpuMF->windowSize : srcSize;
+        size_t s = w;
         while (s > 1)
         {
             s >>= 1;
             windowLog++;
         }
         if (windowLog > 27) windowLog = 27; /* cap at zstd max */
-        if (windowLog < 15) windowLog = 15;
     }
     unsigned const maxDistance = windowLog;
 
@@ -455,7 +457,7 @@ static size_t ZSTD_runGpuMatchFinding(
     if (cudaGetLastError() != cudaSuccess)
         return ERROR(GPU_kernelLaunchFailed);
 
-    /* Synchronize stream to ensure kernel is complete before copying results 
+    /* Synchronize stream to ensure kernel is complete before copying results */
     if (const cudaError_t syncErr = cudaStreamSynchronize(gpuMF->stream); syncErr != cudaSuccess)
     {
         fprintf(stderr, "DEBUG: Stream sync error before copy: %s (code=%d)\n", cudaGetErrorString(syncErr),
@@ -493,7 +495,8 @@ static int compareSequences(const void* a, const void* b)
  * We sort them by position and calculate literal lengths correctly.
  */
 static size_t ZSTD_convertResultsToSequences(ZSTD_GpuMatchFinder const* gpuMF, ZSTD_Sequence* dst,
-                                             const size_t dstCapacity, void const* src, unsigned rep[])
+                                             const size_t dstCapacity, void const* src, const size_t srcSize,
+                                             unsigned rep[])
 {
     if (!gpuMF || !dst || !src) return ERROR(GPU_invalidParameter);
 
@@ -515,18 +518,25 @@ static size_t ZSTD_convertResultsToSequences(ZSTD_GpuMatchFinder const* gpuMF, Z
         unsigned const matchLen = results->sequences[i].matchLength;
 
         if (offset == 0) continue; /* No match */
+        if (position < currentPos) continue; /* Overlaps the previous match : skip */
+
+        /* A match must not extend beyond the end of the block */
+        unsigned mLen = matchLen;
+        size_t const remaining = (srcSize > position) ? srcSize - position : 0;
+        if (mLen > remaining) mLen = static_cast<unsigned>(remaining);
+        if (mLen < MINMATCH) continue; /* Too short (or empty) after clamping */
 
         /* Calculate literal length: bytes from current position to match start */
         const auto litLen = static_cast<unsigned>(position - currentPos);
 
         /* Store sequence */
         dst[seqIdx].litLength = litLen;
-        dst[seqIdx].matchLength = matchLen; /* Actual match length - wrapper converts to mlBase */
+        dst[seqIdx].matchLength = mLen; /* Actual match length - wrapper converts to mlBase */
         dst[seqIdx].offset = offset;
         dst[seqIdx].rep = 0; /* Repcodes not yet supported */
 
         seqIdx++;
-        currentPos = position + matchLen; /* Advance to end of this match */
+        currentPos = position + mLen; /* Advance to end of this match */
     }
 
     /* Update repetition codes */
@@ -667,7 +677,7 @@ size_t ZSTD_compressBlock_gpu(ZSTD_GpuMatchFinder* gpuMF, ZSTD_Sequence* dst, co
         return result;
 
     /* Convert results to ZSTD_Sequence format */
-    size_t const nbSeq = ZSTD_convertResultsToSequences(gpuMF, dst, dstCapacity, src, rep);
+    size_t const nbSeq = ZSTD_convertResultsToSequences(gpuMF, dst, dstCapacity, src, srcSize, rep);
 
     return nbSeq;
 }
@@ -681,13 +691,11 @@ size_t ZSTD_estimateGpuMatchFinderMemory(ZSTD_GpuCompressionParameters const* cP
     /* Window buffer */
     total += srcSize + ZSTD_BLOCKSIZE_MAX;
 
-    /* Hash table */
-    total += static_cast<size_t>(1) << cParams->hashLog;
-    total *= sizeof(unsigned);
+    /* Hash table : 2^hashLog entries of unsigned */
+    total += (static_cast<size_t>(1) << cParams->hashLog) * sizeof(unsigned);
 
-    /* Chain table */
-    total += static_cast<size_t>(1) << cParams->chainLog;
-    total *= sizeof(unsigned);
+    /* Chain table : 2^chainLog entries of unsigned */
+    total += (static_cast<size_t>(1) << cParams->chainLog) * sizeof(unsigned);
 
     /* Results buffer */
     total += sizeof(ZSTD_GpuMatchResult);

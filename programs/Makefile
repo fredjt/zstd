@@ -27,6 +27,8 @@ else
   ALIGN_LOOP =
 endif
 
+# ZSTDLIB_COMPRESS_SRC inherits the CUDA wrapper exclusion from libzstd.mk :
+# the wrapper is only present in the list when the CUDA build is enabled.
 ZSTDLIB_COMMON_SRC := $(sort $(ZSTD_COMMON_FILES))
 ZSTDLIB_COMPRESS_SRC := $(sort $(ZSTD_COMPRESS_FILES))
 ZSTDLIB_DECOMPRESS_SRC := $(sort $(ZSTD_DECOMPRESS_FILES))

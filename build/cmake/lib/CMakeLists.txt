@@ -76,7 +76,7 @@ if (ZSTD_BUILD_GPU)
             ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder.cu
         )
         set_source_files_properties(${LIBRARY_DIR}/compress/zstd_cuda_matchfinder.cu PROPERTIES LANGUAGE CUDA)
-        set(CMAKE_CUDA_ARCHITECTURES "80;89;90")
+        set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")
         
         # Add wrapper to main library sources (not the .cu file)
         list(APPEND ZSTD_GPU_SOURCES ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder_wrapper.c)
