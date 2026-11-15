@@ -69,3 +69,6 @@ perf.data.old
 .local/state/gh/
 .cache/
 .gitconfig
+
+# G7 perf harness build artifact
+/tests/perf/gpu_cpu_bench
