@@ -36,6 +36,21 @@ jobs:
       run: |
         cmake --build cmake-build --config Release
 
+  # Build without the tests, so C++ is not enabled, with CMAKE_CXX_COMPILER set as cross toolchain files do.
+  # The x86-64 assembly is only built when the compilation flags are applied.
+  cmake-c-only:
+    name: "CMake C only (No ZSTD_BUILD_TESTS)"
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+    - name: Configure and build
+      run: |
+        cmake -S build/cmake -B cmake-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_CXX_COMPILER=g++
+        cmake --build cmake-build --parallel
+    - name: Check that the x86-64 assembly is built
+      run: |
+        nm cmake-build/lib/libzstd.a | grep -q HUF_decompress4X1_usingDTable_internal_fast_asm_loop
+
   # Ubuntu-based cmake build using make wrapper
   # This test uses the make-driven cmake build to ensure compatibility
   # with the existing build system integration
@@ -89,7 +104,7 @@ jobs:
   # Tests multiple generators and toolchains to ensure broad Windows compatibility
   # including MSVC (x64, Win32, ARM64), MinGW, and Clang-CL with various architectures and optimizations
   cmake-windows-comprehensive:
-    name: "CMake Windows VS2022 (${{ matrix.name }})"
+    name: "CMake Windows (${{ matrix.name }})"
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -111,10 +126,10 @@ jobs:
             runner: "windows-2022"
             # Intentionally omit ZSTD_BUILD_TESTS to reproduce the CXX language configuration bug
             cmake_extra_flags: "-DCMAKE_COMPILE_WARNING_AS_ERROR=ON"
-          - generator: "Visual Studio 17 2022"
+          - generator: "Visual Studio 18 2026"  # windows-11-arm image ships VS 2026 only
             flags: "-A ARM64"
             name: "MSVC ARM64"
-            runner: "windows-11-arm"  # githuh runner for WOA instance
+            runner: "windows-11-arm"  # github runner for WOA instance
           - generator: "MinGW Makefiles"
             flags: ""
             name: "MinGW"
@@ -125,6 +140,12 @@ jobs:
             name: "Clang-CL"
             runner: "windows-2022"
             cmake_extra_flags: "-DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DZSTD_BUILD_TESTS=ON"
+          - generator: "Visual Studio 17 2022"
+            flags: "-T ClangCL"
+            name: "Clang-CL (No ZSTD_BUILD_TESTS)"
+            runner: "windows-2022"
+            # Intentionally omit ZSTD_BUILD_TESTS: C++ is not enabled, so only the C compiler id is set
+            cmake_extra_flags: "-DCMAKE_COMPILE_WARNING_AS_ERROR=ON"
           - generator: "Visual Studio 17 2022"
             flags: "-T ClangCL -A x64 -DCMAKE_C_FLAGS=/arch:AVX2"
             name: "Clang-CL AVX2"
@@ -154,7 +175,7 @@ jobs:
   # Uses native ARM64 hardware for optimal performance and compatibility testing
   cmake-macos-arm64:
     name: "CMake macOS ARM64 (Apple Silicon)"
-    runs-on: macos-14  # ARM64 runner
+    runs-on: macos-latest  # ARM64 runner
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: "CMake build and test (ARM64)"

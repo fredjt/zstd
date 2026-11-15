@@ -226,6 +226,7 @@ static void usageAdvanced(const char* programName)
     DISPLAYOUT("\n");
     DISPLAYOUT("Advanced compression options:\n");
     DISPLAYOUT("  --ultra                       Enable levels beyond %i, up to %i; requires more memory.\n", ZSTDCLI_CLEVEL_MAX, ZSTD_maxCLevel());
+    DISPLAYOUT("  --max                         Enable the maximum compression settings.\n");
     DISPLAYOUT("  --fast[=#]                    Use to very fast compression levels. [Default: %u]\n", 1);
 #ifdef ZSTD_GZCOMPRESS
     if (exeNameMatch(programName, ZSTD_GZ)) {     /* behave like gzip */
@@ -1676,6 +1677,8 @@ int main(int argCount, const char* argv[])
         (void)ultra; (void)cLevel; (void)ldmFlag; (void)literalCompressionMode;
         (void)targetCBlockSize; (void)streamSrcSize; (void)srcSizeHint;
         (void)ZSTD_strategyMap; (void)useRowMatchFinder; (void)cType;
+        (void)g_overlapLog; (void)g_ldmHashLog; (void)g_ldmMinMatch;
+        (void)g_ldmHashRateLog; (void)g_ldmBucketSizeLog;
         DISPLAYLEVEL(1, "Compression not supported \n");
 #endif
     } else {  /* decompression or test */

@@ -20,7 +20,7 @@ jobs:
     - name: make all
       run: make all
 
-  # lasts ~19mn
+  # lasts ~8mn
   make-test:
     runs-on: ubuntu-latest
     env:
@@ -30,17 +30,17 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: make test
       run: |
-        make test
+        make -j test
         make -j zstd
         ./tests/test_process_substitution.bash ./zstd
 
-  # lasts ~16mn
+  # lasts ~9mn
   make-test-macos:
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: make test on macos
-      run: make test
+      run: make -j test
 
   # lasts ~10mn
   make-test-32bit:
@@ -66,13 +66,13 @@ jobs:
       run: |
         CFLAGS="-Werror -O3" make -j -C tests test-largeDictionary
 
-  # lasts ~9mn
+  # lasts ~4mn
   no-intrinsics-fuzztest:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: no intrinsics fuzztest
-      run: MOREFLAGS="-DZSTD_NO_INTRINSICS" make -C tests fuzztest
+      run: MOREFLAGS="-DZSTD_NO_INTRINSICS" make -j -C tests fuzztest
 
   # lasts ~8mn
   tsan-zstreamtest:
@@ -89,13 +89,13 @@ jobs:
     - name: ub + address sanitizer on zstreamtest
       run: CC=clang make uasan-test-zstream
 
-  # lasts ~11mn
+  # lasts ~5mn
   tsan-fuzztest:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: thread sanitizer fuzztest
-      run: CC=clang make tsan-fuzztest
+      run: CC=clang make -j tsan-fuzztest
 
   big-tests-zstreamtest32:
     runs-on: ubuntu-latest
@@ -107,7 +107,7 @@ jobs:
         make libc6install
         CC=clang make -C tests test-zstream32 FUZZER_FLAGS="--big-tests"
 
-  # lasts ~13mn
+  # lasts ~8mn
   gcc-8-asan-ubsan-testzstd:
     runs-on: ubuntu-latest
     steps:
@@ -115,9 +115,11 @@ jobs:
     - name: gcc-8 + ASan + UBSan + Test Zstd
       # See https://askubuntu.com/a/1428822
       run: |
+        # the ASan runtime of gcc-8 loops on DEADLYSIGNAL with the 32-bit mmap ASLR of recent kernels
+        sudo sysctl -w vm.mmap_rnd_bits=28
         echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu focal main universe" | sudo tee -a /etc/apt/sources.list
         sudo apt-get -qqq update
-        make gcc8install
+        sudo apt-get -yq --no-install-suggests --no-install-recommends install libc6-dev-i386 gcc-multilib gcc-8 gcc-8-multilib
         CC=gcc-8 make -j uasan-test-zstd </dev/null V=1
 
   clang-asan-ubsan-testzstd:
@@ -126,6 +128,13 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: clang + ASan + UBSan + Test Zstd
       run: CC=clang make -j uasan-test-zstd </dev/null V=1
+
+  clang-asan-ubsan-cli-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+    - name: clang + ASan + UBSan + CLI tests
+      run: CC=clang make -j uasan-test-cli-tests
 
   gcc-asan-ubsan-testzstd-32bit:
     runs-on: ubuntu-latest
@@ -148,17 +157,19 @@ jobs:
     - name: gcc-8 + ASan + UBSan + Fuzz Test
       # See https://askubuntu.com/a/1428822
       run: |
+        # the ASan runtime of gcc-8 loops on DEADLYSIGNAL with the 32-bit mmap ASLR of recent kernels
+        sudo sysctl -w vm.mmap_rnd_bits=28
         echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu focal main universe" | sudo tee -a /etc/apt/sources.list
         sudo apt-get -qqq update
-        make gcc8install
-        CC=gcc-8 FUZZER_FLAGS="--long-tests" make clean uasan-fuzztest
+        sudo apt-get -yq --no-install-suggests --no-install-recommends install libc6-dev-i386 gcc-multilib gcc-8 gcc-8-multilib
+        CC=gcc-8 FUZZER_FLAGS="--long-tests" make -j clean uasan-fuzztest
 
   clang-asan-ubsan-fuzz:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: clang + ASan + UBSan + Fuzz Test
-      run: CC=clang FUZZER_FLAGS="--long-tests" make clean uasan-fuzztest
+      run: CC=clang FUZZER_FLAGS="--long-tests" make -j clean uasan-fuzztest
 
   # the only job decoding real legacy frames under sanitizers.
   # fuzzers do build these decoders, but only reach them if an input
@@ -178,7 +189,7 @@ jobs:
       run: |
         sudo apt-get -qqq update
         make libc6install
-        CFLAGS="-O3 -m32" FUZZER_FLAGS="--long-tests" make uasan-fuzztest
+        CFLAGS="-O3 -m32" FUZZER_FLAGS="--long-tests" make -j uasan-fuzztest
 
   clang-asan-fuzz32:
     runs-on: ubuntu-latest
@@ -188,7 +199,7 @@ jobs:
       run: |
         sudo apt-get -qqq update
         make libc6install
-        CC=clang CFLAGS="-O3 -m32" FUZZER_FLAGS="--long-tests" make asan-fuzztest
+        CC=clang CFLAGS="-O3 -m32" FUZZER_FLAGS="--long-tests" make -j asan-fuzztest
 
 # The following test seems to have issues on github CI specifically,
 # it does not provide the `__mulodi4` instruction emulation
@@ -231,10 +242,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
       - name: clang + MSan + Fuzz Test
+        # -O0 targets the unit tests on unoptimized code: random fuzzing is kept short.
+        # clang-msan-fuzz runs the long random fuzzing.
         run: |
           sudo apt-get -qqq update
           sudo apt-get install clang
-          CC=clang MOREFLAGS="-O0" make clean msan-fuzztest
+          CC=clang MOREFLAGS="-O0" FUZZERTEST=-T60s ZSTREAM_TESTTIME=-T30s make clean msan-fuzztest
 
   clang-msan-fuzz:
     runs-on: ubuntu-latest
@@ -251,8 +264,10 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
     - name: clang + MSan + Test Zstd
+      # ZSTDRTTEST= : skip the large data tests of playTests.sh, too slow under MSan.
+      # They still run in the make-test* and ASan + UBSan testzstd jobs.
       run: |
-        CC=clang make -j msan-test-zstd HAVE_ZLIB=0 HAVE_LZ4=0 HAVE_LZMA=0 V=1
+        CC=clang make -j msan-test-zstd HAVE_ZLIB=0 HAVE_LZ4=0 HAVE_LZMA=0 ZSTDRTTEST= V=1
 
   armfuzz:
       runs-on: ubuntu-latest
@@ -304,7 +319,7 @@ jobs:
         $CXX --version
         make -C tests fuzztest
 
-  # lasts ~20mn
+  # lasts ~14mn
   oss-fuzz:
     runs-on: ubuntu-latest
     strategy:
@@ -327,7 +342,7 @@ jobs:
         dry-run: false
         sanitizer: ${{ matrix.sanitizer }}
     - name: Upload Crash
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag=v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # tag=v7.0.2
       if: failure() && steps.build.outcome == 'success'
       with:
         name: ${{ matrix.sanitizer }}-artifacts

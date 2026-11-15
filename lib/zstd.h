@@ -598,6 +598,7 @@ typedef enum {
  *  - The session : will stop compressing current frame, and make CCtx ready to start a new one.
  *                  Useful after an error, or to interrupt any ongoing compression.
  *                  Any internal data not yet flushed is cancelled.
+ *                  With nbWorkers >= 1, it waits for the jobs already started to complete.
  *                  Compression parameters and dictionary remain unchanged.
  *                  They will be used to compress next frame.
  *                  Resetting session never fails.
@@ -1030,7 +1031,8 @@ ZSTDLIB_API size_t      ZSTD_freeDDict(ZSTD_DDict* ddict);
 
 /*! ZSTD_decompress_usingDDict() :
  *  Decompression using a digested Dictionary.
- *  Recommended when same dictionary is used multiple times. */
+ *  Recommended when same dictionary is used multiple times.
+ *  Uses the supplied DDict, regardless of dictionaries referenced in dctx. */
 ZSTDLIB_API size_t ZSTD_decompress_usingDDict(ZSTD_DCtx* dctx,
                                               void* dst, size_t dstCapacity,
                                         const void* src, size_t srcSize,
@@ -1151,6 +1153,8 @@ ZSTDLIB_API size_t ZSTD_CCtx_refPrefix(ZSTD_CCtx* cctx,
  * @result : 0, or an error code (which can be tested with ZSTD_isError()).
  *  Special : Adding a NULL (or 0-size) dictionary invalidates any previous dictionary,
  *            meaning "return to no-dictionary mode".
+ *  Loading any dictionary also discards the multiple-DDict reference table,
+ *  without disabling ZSTD_d_refMultipleDDicts.
  *  Note 1 : Loading a dictionary involves building tables,
  *           which has a non-negligible impact on CPU usage and latency.
  *           It's recommended to "load once, use many times", to amortize the cost
@@ -1163,13 +1167,20 @@ ZSTDLIB_API size_t ZSTD_DCtx_loadDictionary(ZSTD_DCtx* dctx, const void* dict, s
 
 /*! ZSTD_DCtx_refDDict() : Requires v1.4.0+
  *  Reference a prepared dictionary, to be used to decompress next frames.
- *  The dictionary remains active for decompression of future frames using same DCtx.
+ *  In single-DDict mode, the dictionary remains active for decompression of
+ *  future frames using the same DCtx.
  *
  *  If called with ZSTD_d_refMultipleDDicts enabled, repeated calls of this function
  *  will store the DDict references in a table, and the DDict used for decompression
  *  will be determined at decompression time, as per the dict ID in the frame.
- *  The memory for the table is allocated on the first call to refDDict, and can be
- *  freed with ZSTD_freeDCtx().
+ *  The memory for the table is allocated on the first call to refDDict.
+ *  The table is freed by ZSTD_DCtx_refDDict(dctx, NULL), by ZSTD_DCtx_reset()
+ *  with ZSTD_reset_parameters or ZSTD_reset_session_and_parameters, by any
+ *  ZSTD_DCtx_loadDictionary() or ZSTD_DCtx_refPrefix() call, by disabling
+ *  multiple-DDict mode, and by ZSTD_freeDCtx().
+ *  Disabling multiple-DDict mode releases all dictionary references from the set;
+ *  no dictionary from the set is retained for subsequent decompression.
+ *  Referencing a DDict invalidates any previously loaded dictionary or prefix.
  *
  *  If called with ZSTD_d_refMultipleDDicts disabled (the default), only one dictionary
  *  will be managed, and referencing a dictionary effectively "discards" any previous one.
@@ -1187,7 +1198,8 @@ ZSTDLIB_API size_t ZSTD_DCtx_refDDict(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict);
  *  Prefix is **only used once**. Reference is discarded at end of frame.
  *  End of frame is reached when ZSTD_decompressStream() returns 0.
  * @result : 0, or an error code (which can be tested with ZSTD_isError()).
- *  Note 1 : Adding any prefix (including NULL) invalidates any previously set prefix or dictionary
+ *  Note 1 : Adding any prefix (including NULL) invalidates any previously set prefix or dictionary,
+ *           including the multiple-DDict reference table.
  *  Note 2 : Prefix buffer is referenced. It **must** outlive decompression.
  *           Prefix buffer must remain unmodified up to the end of frame,
  *           reached when ZSTD_decompressStream() returns 0.
@@ -1708,6 +1720,8 @@ ZSTD_compressSequences(ZSTD_CCtx* cctx,
  * - @litBufCapacity is the size of the underlying buffer into which literals are written, starting at address @literals.
  *   @litBufCapacity must be at least 8 bytes larger than @litSize.
  * - @decompressedSize must be correct, and correspond to the sum of all Sequences. Any discrepancy will generate an error.
+ * - Each block must regenerate at most ZSTD_BLOCKSIZE_MAX bytes, or less with a smaller window or ZSTD_c_maxBlockSize.
+ *   A larger block will generate an error.
  * @return : final compressed size, or a ZSTD error code.
  */
 ZSTDLIB_STATIC_API size_t
@@ -1822,6 +1836,8 @@ ZSTDLIB_STATIC_API size_t ZSTD_estimateDStreamSize_fromFrame(const void* src, si
 /*! ZSTD_estimate?DictSize() :
  *  ZSTD_estimateCDictSize() will bet that src size is relatively "small", and content is copied, like ZSTD_createCDict().
  *  ZSTD_estimateCDictSize_advanced() makes it possible to control compression parameters precisely, like ZSTD_createCDict_advanced().
+ *  These estimates return an error code if dictSize is too large.
+ *  Check the result with ZSTD_isError().
  *  Note : dictionaries created by reference (`ZSTD_dlm_byRef`) are logically smaller.
  */
 ZSTDLIB_STATIC_API size_t ZSTD_estimateCDictSize(size_t dictSize, int compressionLevel);
@@ -1845,7 +1861,10 @@ ZSTDLIB_STATIC_API size_t ZSTD_estimateDDictSize(size_t dictSize, ZSTD_dictLoadM
  *  Note 3 : cParams : use ZSTD_getCParams() to convert a compression level
  *           into its associated cParams.
  *  Limitation 1 : currently not compatible with internal dictionary creation, triggered by
- *                 ZSTD_CCtx_loadDictionary(), ZSTD_initCStream_usingDict() or ZSTD_initDStream_usingDict().
+ *                 ZSTD_CCtx_loadDictionary(), ZSTD_DCtx_loadDictionary(), ZSTD_DCtx_refPrefix(),
+ *                 ZSTD_initCStream_usingDict() or ZSTD_initDStream_usingDict().
+ *                 For one-shot decompression, ZSTD_decompress_usingDict() needs no allocation.
+ *                 Otherwise, use ZSTD_initStaticDDict() + ZSTD_DCtx_refDDict().
  *  Limitation 2 : static cctx currently not compatible with multi-threading.
  *  Limitation 3 : static dctx is incompatible with legacy support.
  */
@@ -1906,9 +1925,10 @@ ZSTDLIB_STATIC_API ZSTD_CDict* ZSTD_createCDict_advanced(const void* dict, size_
  *  This can limit resources for applications with multiple threads where each one uses
  *  a threaded compression mode (via ZSTD_c_nbWorkers parameter).
  *  ZSTD_createThreadPool creates a new thread pool with a given number of threads.
+ *  ZSTD_c_nbWorkers does not change the number of threads of such a pool.
  *  Note that the lifetime of such pool must exist while being used.
  *  ZSTD_CCtx_refThreadPool assigns a thread pool to a context (use NULL argument value
- *  to use an internal thread pool).
+ *  to use an internal thread pool). The context then no longer uses its previous pool.
  *  ZSTD_freeThreadPool frees a thread pool, accepts NULL pointer.
  */
 typedef struct POOL_ctx_s ZSTD_threadPool;
@@ -2558,7 +2578,22 @@ ZSTDLIB_STATIC_API size_t ZSTD_DCtx_getParameter(ZSTD_DCtx* dctx, ZSTD_dParamete
  * to store references to multiple ZSTD_DDict. That is, multiple calls of ZSTD_refDDict()
  * using a given ZSTD_DCtx, rather than overwriting the previous DDict reference, will instead
  * store all references. At decompression time, the appropriate dictID is selected
- * from the set of DDicts based on the dictID in the frame.
+ * from the set of DDicts based on the dictID in each frame. This applies to
+ * ZSTD_decompressDCtx() and ZSTD_decompressStream(); entry points taking an
+ * explicit dictionary use that dictionary instead.
+ * When a set exists, an ordinary Zstandard frame with a nonzero dictionary ID must
+ * have an exact match in the set; otherwise decompression returns
+ * ZSTD_error_dictionary_wrong. A frame with dictionary ID 0 (including an omitted
+ * ID) uses the registered ID-0 DDict if present, or no dictionary otherwise.
+ * There is no default dictionary in the set, and a lookup does not change the
+ * dictionary used by another frame.
+ * Skippable frames do not select a dictionary. Legacy formats are not supported
+ * by set-based decoding; use a single or explicitly supplied dictionary instead.
+ * Loading a dictionary or referencing a prefix discards the referenced set,
+ * without disabling this mode. Referencing a DDict discards any previously
+ * loaded dictionary or prefix. The two kinds of dictionary storage cannot coexist.
+ * Disabling this mode discards the entire set. No dictionary from the set is
+ * retained for subsequent decompression.
  *
  * Usage is simply calling ZSTD_refDDict() on multiple dict buffers.
  *
@@ -3038,10 +3073,6 @@ ZSTDLIB_STATIC_API size_t ZSTD_compressBegin_usingDict(ZSTD_CCtx* cctx, const vo
 ZSTD_DEPRECATED("The buffer-less API is deprecated in favor of the normal streaming API. See docs.")
 ZSTDLIB_STATIC_API size_t ZSTD_compressBegin_usingCDict(ZSTD_CCtx* cctx, const ZSTD_CDict* cdict); /**< note: fails if cdict==NULL */
 
-ZSTD_DEPRECATED("This function will likely be removed in a future release. It is misleading and has very limited utility.")
-ZSTDLIB_STATIC_API
-size_t ZSTD_copyCCtx(ZSTD_CCtx* cctx, const ZSTD_CCtx* preparedCCtx, unsigned long long pledgedSrcSize); /**<  note: if pledgedSrcSize is not known, use ZSTD_CONTENTSIZE_UNKNOWN */
-
 ZSTD_DEPRECATED("The buffer-less API is deprecated in favor of the normal streaming API. See docs.")
 ZSTDLIB_STATIC_API size_t ZSTD_compressContinue(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize);
 ZSTD_DEPRECATED("The buffer-less API is deprecated in favor of the normal streaming API. See docs.")
@@ -3098,8 +3129,12 @@ size_t ZSTD_compressBegin_usingCDict_advanced(ZSTD_CCtx* const cctx, const ZSTD_
   as long as the encoder and decoder progress in "lock-step",
   aka use exactly the same buffer sizes, break contiguity at the same place, etc.
 
-  Once buffers are setup, start decompression, with ZSTD_decompressBegin().
+  Once buffers are set up and decompression parameters are configured, initialize the decoder with ZSTD_decompressBegin().
   If decompression requires a dictionary, use ZSTD_decompressBegin_usingDict() or ZSTD_decompressBegin_usingDDict().
+  One of these initialization functions must be called before the first ZSTD_decompressContinue() call for every frame,
+  including when reusing a context or after calling ZSTD_DCtx_reset().
+  ZSTD_DCtx_reset() does not replace this initialization, and ZSTD_decompressContinue() does not initialize the decoder itself.
+  After a session reset, an interrupted frame cannot be resumed : initialize the decoder again and restart from the frame's beginning.
 
   Then use ZSTD_nextSrcSizeToDecompress() and ZSTD_decompressContinue() alternatively.
   ZSTD_nextSrcSizeToDecompress() tells how many bytes to provide as 'srcSize' to ZSTD_decompressContinue().
@@ -3110,7 +3145,7 @@ size_t ZSTD_compressBegin_usingCDict_advanced(ZSTD_CCtx* const cctx, const ZSTD_
   It can also be an error code, which can be tested with ZSTD_isError().
 
   A frame is fully decoded when ZSTD_nextSrcSizeToDecompress() returns zero.
-  Context can then be reset to start a new decompression.
+  Before decoding another frame, call the appropriate ZSTD_decompressBegin*() function again.
 
   Note : it's possible to know if next input to present is a header or a block, using ZSTD_nextInputType().
   This information is not required to properly decode a frame.
@@ -3131,16 +3166,28 @@ size_t ZSTD_compressBegin_usingCDict_advanced(ZSTD_CCtx* const cctx, const ZSTD_
 
 ZSTDLIB_STATIC_API size_t ZSTD_decodingBufferSize_min(unsigned long long windowSize, unsigned long long frameContentSize);  /**< when frame content size is not known, pass in frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN */
 
+/*! ZSTD_decompressBegin() :
+ *  Initialize the bufferless decoder to start a new frame without a dictionary.
+ *  Decompression parameters must be configured before calling this function.
+ *  Call this function, ZSTD_decompressBegin_usingDict(), or ZSTD_decompressBegin_usingDDict()
+ *  before the first ZSTD_decompressContinue() call for each frame, including after ZSTD_DCtx_reset().
+ *  Use the dictionary-taking variants when the frame requires a dictionary.
+ */
 ZSTDLIB_STATIC_API size_t ZSTD_decompressBegin(ZSTD_DCtx* dctx);
 ZSTDLIB_STATIC_API size_t ZSTD_decompressBegin_usingDict(ZSTD_DCtx* dctx, const void* dict, size_t dictSize);
 ZSTDLIB_STATIC_API size_t ZSTD_decompressBegin_usingDDict(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict);
 
 ZSTDLIB_STATIC_API size_t ZSTD_nextSrcSizeToDecompress(ZSTD_DCtx* dctx);
+
+/*! ZSTD_decompressContinue() :
+ *  Decode the next part of a frame initialized with ZSTD_decompressBegin()
+ *  or one of its dictionary-taking variants. This function does not initialize the decoder.
+ *  After finishing a frame or resetting the session, initialize the decoder again
+ *  before calling this function for a new frame.
+ */
 ZSTDLIB_STATIC_API size_t ZSTD_decompressContinue(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize);
 
 /* misc */
-ZSTD_DEPRECATED("This function will likely be removed in the next minor release. It is misleading and has very limited utility.")
-ZSTDLIB_STATIC_API void   ZSTD_copyDCtx(ZSTD_DCtx* dctx, const ZSTD_DCtx* preparedDCtx);
 typedef enum { ZSTDnit_frameHeader, ZSTDnit_blockHeader, ZSTDnit_block, ZSTDnit_lastBlock, ZSTDnit_checksum, ZSTDnit_skippableFrame } ZSTD_nextInputType_e;
 ZSTDLIB_STATIC_API ZSTD_nextInputType_e ZSTD_nextInputType(ZSTD_DCtx* dctx);
 

@@ -1043,6 +1043,107 @@ static int basicUnitTests(U32 seed, double compressibility, int bigTests)
         }
         DISPLAYLEVEL(3, "OK \n");
 
+        DISPLAYLEVEL(3, "test%3i : ZSTD_c_stableInBuffer : a new session ignores input pending in the abandoned frame : ", testNb++);
+        {   ZSTD_CCtx* const cctx2 = ZSTD_createCCtx();
+            const char* const src2 = (const char*)CNBuffer + 1 MB;
+            size_t const srcSize2 = 50 KB;
+            int pendingCase;
+            assert(cctx2 != NULL);
+            /* 0: pending before initialization, 1: pending within a frame,
+             * 2: multi-threaded, 3: new session started by ZSTD_compress2() */
+            for (pendingCase = 0; pendingCase < 4; pendingCase++) {
+                ZSTD_inBuffer inBuf;
+                ZSTD_outBuffer outBuf;
+                size_t frameSize;
+                inBuf.src = CNBuffer;
+                inBuf.size = (pendingCase == 1) ? 200 KB : 1 KB;
+                inBuf.pos = 0;
+                outBuf.dst = compressedBuffer;
+                outBuf.size = compressedBufferSize;
+                outBuf.pos = 0;
+                CHECK_Z( ZSTD_CCtx_reset(cctx2, ZSTD_reset_session_and_parameters) );
+                CHECK_Z( ZSTD_CCtx_setParameter(cctx2, ZSTD_c_stableInBuffer, 1) );
+                if (pendingCase == 2) CHECK_Z( ZSTD_CCtx_setParameter(cctx2, ZSTD_c_nbWorkers, 2) );
+                CHECK_Z( ZSTD_compressStream2(cctx2, &outBuf, &inBuf, ZSTD_e_continue) );
+                if (pendingCase == 3) {
+                    frameSize = ZSTD_compress2(cctx2, compressedBuffer, compressedBufferSize, src2, srcSize2);
+                    CHECK_Z(frameSize);
+                } else {
+                    CHECK_Z( ZSTD_CCtx_reset(cctx2, ZSTD_reset_session_only) );
+                    inBuf.src = src2;
+                    inBuf.size = srcSize2;
+                    inBuf.pos = 0;
+                    outBuf.pos = 0;
+                    /* unknown size : keeps multi-threading enabled */
+                    if (pendingCase == 2) CHECK_Z( ZSTD_compressStream2(cctx2, &outBuf, &inBuf, ZSTD_e_flush) );
+                    CHECK(ZSTD_compressStream2(cctx2, &outBuf, &inBuf, ZSTD_e_end) != 0, "compression should be successful and fully flushed");
+                    frameSize = outBuf.pos;
+                }
+                {   size_t const decSize = ZSTD_decompress(decodedBuffer, CNBufferSize, compressedBuffer, frameSize);
+                    CHECK_Z(decSize);
+                    CHECK(decSize != srcSize2, "case %i : regenerated %u bytes, instead of %u", pendingCase, (unsigned)decSize, (unsigned)srcSize2);
+                    CHECK(memcmp(src2, decodedBuffer, srcSize2) != 0, "case %i : regenerated data different from original", pendingCase);
+            }   }
+            ZSTD_freeCCtx(cctx2);
+        }
+        DISPLAYLEVEL(3, "OK \n");
+
+        DISPLAYLEVEL(3, "test%3i : ZSTD_c_stableInBuffer : pending input is checked when compression starts : ", testNb++);
+        {   ZSTD_CCtx* const cctx2 = ZSTD_createCCtx();
+            int violation;
+            assert(cctx2 != NULL);
+            /* 0: different src pointer, 1: ZSTD_c_stableInBuffer disabled */
+            for (violation = 0; violation < 2; violation++) {
+                ZSTD_inBuffer inBuf;
+                ZSTD_outBuffer outBuf;
+                inBuf.src = CNBuffer;
+                inBuf.size = 1 KB;
+                inBuf.pos = 0;
+                outBuf.dst = compressedBuffer;
+                outBuf.size = compressedBufferSize;
+                outBuf.pos = 0;
+                CHECK_Z( ZSTD_CCtx_reset(cctx2, ZSTD_reset_session_and_parameters) );
+                CHECK_Z( ZSTD_CCtx_setParameter(cctx2, ZSTD_c_stableInBuffer, 1) );
+                CHECK_Z( ZSTD_compressStream2(cctx2, &outBuf, &inBuf, ZSTD_e_continue) );
+                if (violation == 0) {
+                    inBuf.src = (const char*)CNBuffer + 1 MB;
+                    inBuf.pos = 0;
+                } else {
+                    CHECK_Z( ZSTD_CCtx_setParameter(cctx2, ZSTD_c_stableInBuffer, 0) );
+                    inBuf.size = 2 KB;
+                }
+                {   size_t const ret = ZSTD_compressStream2(cctx2, &outBuf, &inBuf, ZSTD_e_end);
+                    CHECK(!ZSTD_isError(ret), "case %i : must error", violation);
+                    CHECK(!(ZSTD_getErrorCode(ret) == ZSTD_error_stabilityCondition_notRespected), "case %i : must be this error", violation);
+            }   }
+            ZSTD_freeCCtx(cctx2);
+        }
+        DISPLAYLEVEL(3, "OK \n");
+
+        DISPLAYLEVEL(3, "test%3i : ZSTD_c_stableInBuffer : ZSTD_endStream() on pending input, new context : ", testNb++);
+        {   ZSTD_CCtx* const cctx2 = ZSTD_createCCtx();
+            ZSTD_inBuffer inBuf;
+            ZSTD_outBuffer outBuf;
+            size_t const srcSize2 = 1 KB;
+            assert(cctx2 != NULL);
+            inBuf.src = CNBuffer;
+            inBuf.size = srcSize2;
+            inBuf.pos = 0;
+            outBuf.dst = compressedBuffer;
+            outBuf.size = compressedBufferSize;
+            outBuf.pos = 0;
+            CHECK_Z( ZSTD_CCtx_setParameter(cctx2, ZSTD_c_stableInBuffer, 1) );
+            CHECK_Z( ZSTD_compressStream2(cctx2, &outBuf, &inBuf, ZSTD_e_continue) );
+            CHECK(ZSTD_endStream(cctx2, &outBuf) != 0, "compression should be successful and fully flushed");
+            {   size_t const decSize = ZSTD_decompress(decodedBuffer, CNBufferSize, compressedBuffer, outBuf.pos);
+                CHECK_Z(decSize);
+                CHECK(decSize != srcSize2, "regenerated %u bytes, instead of %u", (unsigned)decSize, (unsigned)srcSize2);
+                CHECK(memcmp(CNBuffer, decodedBuffer, srcSize2) != 0, "regenerated data different from original");
+            }
+            ZSTD_freeCCtx(cctx2);
+        }
+        DISPLAYLEVEL(3, "OK \n");
+
         DISPLAYLEVEL(3, "test%3i : ZSTD_compressStream2() with ZSTD_c_stableOutBuffer only : ", testNb++);
         CHECK_Z(ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters));
         CHECK_Z(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1));
@@ -1405,6 +1506,39 @@ static int basicUnitTests(U32 seed, double compressibility, int bigTests)
         if (!ZSTD_isError(r)) goto _output_error;  /* must fail : dictionary not used */
         DISPLAYLEVEL(3, "OK (%s)\n", ZSTD_getErrorName(r));
     }
+
+    DISPLAYLEVEL(3, "test%3i : prefix is dropped by session reset after a rejected frame header : ", testNb++);
+    {   BYTE const badHeader[6] = { 0x28, 0xB5, 0x2F, 0xFD, 0x08, 0x00 };  /* reserved bit set */
+        CHECK_Z( ZSTD_DCtx_refPrefix(zd, dictionary.start, dictionary.filled) );
+        outBuff.dst = decodedBuffer;
+        outBuff.size = CNBufferSize;
+        outBuff.pos = 0;
+        inBuff.src = badHeader;
+        inBuff.size = sizeof(badHeader);
+        inBuff.pos = 0;
+        if (!ZSTD_isError(ZSTD_decompressStream(zd, &outBuff, &inBuff))) goto _output_error;
+        CHECK_Z( ZSTD_DCtx_reset(zd, ZSTD_reset_session_only) );
+        outBuff.pos = 0;
+        inBuff.src = compressedBuffer;
+        inBuff.size = cSize;
+        inBuff.pos = 0;
+        if (!ZSTD_isError(ZSTD_decompressStream(zd, &outBuff, &inBuff))) goto _output_error;  /* prefix must be gone */
+        CHECK_Z( ZSTD_DCtx_reset(zd, ZSTD_reset_session_only) );
+    }
+    DISPLAYLEVEL(3, "OK \n");
+
+    DISPLAYLEVEL(3, "test%3i : prefix survives session reset before any input : ", testNb++);
+    CHECK_Z( ZSTD_DCtx_refPrefix(zd, dictionary.start, dictionary.filled) );
+    CHECK_Z( ZSTD_DCtx_reset(zd, ZSTD_reset_session_only) );
+    outBuff.dst = decodedBuffer;
+    outBuff.size = CNBufferSize;
+    outBuff.pos = 0;
+    inBuff.src = compressedBuffer;
+    inBuff.size = cSize;
+    inBuff.pos = 0;
+    CHECK_Z( ZSTD_decompressStream(zd, &outBuff, &inBuff) );
+    if (outBuff.pos != CNBufferSize) goto _output_error;  /* must regenerate whole input */
+    DISPLAYLEVEL(3, "OK \n");
 
     DISPLAYLEVEL(3, "test%3i : compress again with ZSTD_compressStream2 : ", testNb++);
     outBuff.dst = compressedBuffer;
@@ -2511,6 +2645,49 @@ static int basicUnitTests(U32 seed, double compressibility, int bigTests)
         ZSTD_freeDCtx(dctx);
     }
     DISPLAYLEVEL(3, "OK \n");
+
+#ifdef ZSTD_MULTITHREAD
+    /* Freeing or resetting the context must wait for the jobs still running,
+     * since they use its dictionary, pools and jobs table */
+    DISPLAYLEVEL(3, "test%3i : abandon a multi-threaded frame with a job in progress : ", testNb++);
+    {   size_t const jobSize = 1 MB;
+        const void* const dict = (const char*)CNBuffer + 2 * jobSize;
+        int scenario;
+        for (scenario = 0; scenario < 5; scenario++) {
+            ZSTD_CCtx* const cctx = ZSTD_createCCtx();
+            ZSTD_threadPool* const pool = (scenario == 1) ? ZSTD_createThreadPool(1) : NULL;
+            ZSTD_inBuffer in = { CNBuffer, (scenario == 2) ? 0 : jobSize, 0 };
+            ZSTD_outBuffer out = { compressedBuffer, compressedBufferSize, 0 };
+            CHECK(cctx == NULL, "ZSTD_createCCtx failed");
+            CHECK_Z( ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 10) );
+            CHECK_Z( ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 1) );
+            CHECK_Z( ZSTD_CCtx_setParameter(cctx, ZSTD_c_jobSize, (int)jobSize) );
+            if (pool != NULL) CHECK_Z( ZSTD_CCtx_refThreadPool(cctx, pool) );
+            CHECK_Z( ZSTD_CCtx_loadDictionary(cctx, dict, 1 MB) );   /* makes the first job slow */
+            CHECK_Z( ZSTD_compressStream2(cctx, &out, &in, ZSTD_e_continue) );   /* starts the first job, if any */
+            if (scenario == 2) {
+                /* empty frame : its only job is empty, and still runs when
+                 * ZSTD_e_end returns because the output buffer is full */
+                out.size = out.pos;
+                CHECK_Z( ZSTD_compressStream2(cctx, &out, &in, ZSTD_e_end) );
+            }
+            if (scenario == 4) {
+                /* the second job is prepared, and waits until the worker is free */
+                in.size = 2 * jobSize;
+                CHECK_Z( ZSTD_compressStream2(cctx, &out, &in, ZSTD_e_continue) );
+            }
+            if (scenario >= 3) {
+                /* abandon the frame, change the dictionary, and compress a new frame */
+                CHECK_Z( ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only) );
+                CHECK_Z( ZSTD_CCtx_loadDictionary(cctx, dict, 512 KB) );
+                CHECK_Z( ZSTD_compress2(cctx, compressedBuffer, compressedBufferSize, CNBuffer, jobSize) );
+            }
+            ZSTD_freeCCtx(cctx);   /* scenarios 0 to 2 free it with a job in progress */
+            ZSTD_freeThreadPool(pool);
+        }
+    }
+    DISPLAYLEVEL(3, "OK \n");
+#endif
 
 _end:
     FUZ_freeDictionary(dictionary);
