@@ -169,6 +169,13 @@ fi
 [ -n "$DATAGEN_BIN" ] || die "datagen not found at $DATAGEN_BIN! \n Please define DATAGEN_BIN pointing to the datagen binary. You might also consider rebuilding zstd tests following the instructions in README.md. "
 println "\nStarting playTests.sh isWindows=$isWindows EXE_PREFIX='$EXE_PREFIX' ZSTD_BIN='$ZSTD_BIN' DATAGEN_BIN='$DATAGEN_BIN'"
 
+# Error string exhaustiveness check : every ZSTD_ErrorCode must have a
+# dedicated string in ERR_getErrorString(). Skipped when the helper was not
+# built (e.g. Visual Studio builds).
+if [ -x ./checkErrorCodes ]; then
+    ./checkErrorCodes
+fi
+
 if echo hello | zstd -v -T2 2>&1 > $INTOVOID | $GREP -q 'multi-threading is disabled'
 then
     hasMT=""

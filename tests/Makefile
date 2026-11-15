@@ -266,6 +266,12 @@ automated_benchmarking: clean
 CLEAN += checkTag
 checkTag.o : $(LIB_SRCDIR)/zstd.h
 
+# make checkErrorCodes : check that every error code has a dedicated error string
+CLEAN += checkErrorCodes
+checkErrorCodes : checkErrorCodes.c $(LIB_SRCDIR)/common/zstd_common.c $(LIB_SRCDIR)/common/error_private.c
+	$(LINK.c) $^ -o $@$(EXT)
+checkErrorCodes.o : $(LIB_SRCDIR)/zstd.h
+
 .PHONY: clean
 clean:
 	$(MAKE) -C $(LIB_SRCDIR) clean
@@ -361,7 +367,7 @@ test-zstd32: zstd32
 test-zstd-nolegacy: ZSTD = $(PRGDIR)/zstd-nolegacy
 test-zstd-nolegacy: zstd-nolegacy
 
-test-zstd test-zstd32 test-zstd-nolegacy test-zstd-dll: datagen
+test-zstd test-zstd32 test-zstd-nolegacy test-zstd-dll: datagen checkErrorCodes
 	file $(ZSTD)
 	EXE_PREFIX="$(QEMU_SYS)" ZSTD_BIN="$(ZSTD)" DATAGEN_BIN=./datagen ./playTests.sh $(ZSTDRTTEST)
 

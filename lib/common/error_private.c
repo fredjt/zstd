@@ -68,6 +68,10 @@ const char* ERR_getErrorString(ERR_enum code)
     case PREFIX(GPU_allocationFailed): return "GPU match finder: allocation failed";
     case PREFIX(GPU_cudaStreamCreationFailed): return "GPU match finder: CUDA stream creation failed";
     case PREFIX(GPU_cudaAllocationFailed): return "GPU match finder: CUDA allocation failed";
+    case PREFIX(GPU_matchFinder_notInitialized): return "GPU match finder: not initialized";
+    case PREFIX(GPU_cudaMemcpyFailed): return "GPU match finder: cudaMemcpy failed";
+    case PREFIX(GPU_kernelLaunchFailed): return "GPU match finder: kernel launch failed";
+    case PREFIX(GPU_blockTooLarge): return "GPU match finder: block too large";
     case PREFIX(maxCode):
     default: return notErrorCode;
     }

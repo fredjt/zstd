@@ -654,6 +654,11 @@ ZSTD_bounds ZSTD_cParam_getBounds(ZSTD_cParameter param)
         bounds.upperBound = (int)ZSTD_ps_disable;
         return bounds;
 
+    case ZSTD_c_gpuMatchFinder:
+        bounds.lowerBound = 0;
+        bounds.upperBound = 1;
+        return bounds;
+
     default:
         bounds.error = ERROR(parameter_unsupported);
         return bounds;
@@ -724,6 +729,7 @@ static int ZSTD_isUpdateAuthorized(ZSTD_cParameter param)
     case ZSTD_c_enableSeqProducerFallback:
     case ZSTD_c_maxBlockSize:
     case ZSTD_c_repcodeResolution:
+    case ZSTD_c_gpuMatchFinder:
     default:
         return 0;
     }
@@ -1191,6 +1197,9 @@ size_t ZSTD_CCtxParams_getParameter(
         break;
     case ZSTD_c_repcodeResolution:
         *value = (int)CCtxParams->searchForExternalRepcodes;
+        break;
+    case ZSTD_c_gpuMatchFinder:
+        *value = CCtxParams->gpuMatchFinder;
         break;
     default: RETURN_ERROR(parameter_unsupported, "unknown parameter");
     }
