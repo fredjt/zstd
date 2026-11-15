@@ -62,15 +62,7 @@ size_t ZSTD_initGpuMatchFinderForCtx(ZSTD_CCtx* zc)
 
 
     /* Create GPU match finder - delegate to .cu implementation */
-    {
-        size_t const err = ZSTD_createGpuMatchFinder((ZSTD_GpuMatchFinder**) &zc->gpuMF, &gpuParams, srcSize);
-        FORWARD_IF_ERROR(err, "GPU match finder creation failed");
-        /* Enforce the CCtx compression window in the kernel (the kernel skips
-         * candidates further away than this window). The window is always a
-         * power of two : 2^windowLog. */
-        ((ZSTD_GpuMatchFinder*) zc->gpuMF)->windowSize = (size_t) (1ULL << zc->appliedParams.cParams.windowLog);
-    }
-    return 0;
+    return ZSTD_createGpuMatchFinder((ZSTD_GpuMatchFinder**) &zc->gpuMF, &gpuParams, srcSize);
 }
 
 /**
@@ -125,9 +117,10 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
     ZSTD_Sequence* seqs = malloc(maxNbSeq * sizeof(ZSTD_Sequence));
     if (!seqs) return ERROR(GPU_allocationFailed);
 
-    /* The GPU always emits raw offsets (rep = 0) : repcodes are not used,
-     * so the rep arrays are left at zero. */
-    rep[0] = rep[1] = rep[2] = 0;
+    /* Initialize rep codes to zero */
+    rep[0] = 1;
+    rep[1] = 2;
+    rep[2] = 3;
 
     /* Run GPU match finding - delegates to .cu implementation */
     const size_t nbSeq = ZSTD_compressBlock_gpu(gpuMF, seqs, maxNbSeq, src, srcSize, rep, rep);
@@ -159,27 +152,13 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
         seq->offBase = seqs[i].offset + ZSTD_REP_NUM;
     }
 
-    /* Copy literal runs and trailing literals into the sequence store, the
-     * same way the CPU matchfinders do : each sequence owns the literals
-     * before its match, and the block's tail is one last literal run. */
-    {
-        const BYTE* const srcB = (const BYTE*) src;
-        size_t pos = 0;
-        for (i = 0; i < nbSeq; i++)
-        {
-            ZSTD_memcpy(zc->seqStore.lit, srcB + pos, seqs[i].litLength);
-            zc->seqStore.lit += seqs[i].litLength;
-            pos += seqs[i].litLength + seqs[i].matchLength;
-        }
-        {
-            size_t const lastLLSize = srcSize - pos;
-            ZSTD_storeLastLiterals_gpu(&zc->seqStore, srcB + pos, lastLLSize);
-        }
-    }
-
-    /* zc->seqStore.lit now points just past the last copied literal, and
-     * sequences points just past the last sequence. */
+    /* Update sequence store pointers.
+     * IMPORTANT: zc->seqStore.lit must point to zc->seqStore.litStart
+     * (the seqStore's own literal buffer), NOT to the source data.
+     * This is because ZSTD_storeLastLiterals() will copy trailing literals
+     * from the source into seqStore->lit, then advance it. */
     zc->seqStore.sequences = zc->seqStore.sequencesStart + nbSeq;
+    zc->seqStore.lit = zc->seqStore.litStart;
 
     free(seqs);
     return ZSTDbss_compress;

@@ -151,9 +151,9 @@ GREP = grep $(GREP_OPTIONS)
 
 ZSTD_COMMON_FILES := $(sort $(wildcard $(LIB_SRCDIR)/common/*.c))
 # The CUDA wrapper is excluded from the source list by default.
-# It is only added back in the GPU section below when a working CUDA
-# toolchain is detected; leaving it in the list would break plain
-# (non-CUDA) program builds at link time.
+# It references symbols defined in zstd_cuda_matchfinder.cu, which is only
+# built when the CUDA path is enabled (see the GPU section below); leaving
+# it in the list would break plain (non-CUDA) program builds at link time.
 ZSTD_COMPRESS_FILES := $(filter-out $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder_wrapper.c, $(sort $(wildcard $(LIB_SRCDIR)/compress/*.c)))
 ZSTD_DECOMPRESS_FILES := $(sort $(wildcard $(LIB_SRCDIR)/decompress/*.c))
 ZSTD_DICTBUILDER_FILES := $(sort $(wildcard $(LIB_SRCDIR)/dictBuilder/*.c))
@@ -229,12 +229,35 @@ ifneq ($(ZSTD_CUDA), 0)
     ifeq ($(CUDA_AVAILABLE), 1)
       # Found nvcc and CUDA headers - add GPU match finder files
       ZSTD_GPU_MATCH_FILES := $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.cu
-      # Add the C wrapper to the source list (excluded by default above)
+
+      # Add the C wrapper back to the source list (excluded by default above)
       ZSTD_COMPRESS_FILES += $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder_wrapper.c
 
-      # Add CUDA include path and library
-      NVCCFLAGS += -I$(LIB_SRCDIR) -I$(LIB_SRCDIR)/common -I$(LIB_SRCDIR)/compress
-      NVCCFLAGS += -arch=sm_50 -Xcompiler "$(CFLAGS)"
+      # C-side GPU code paths (zstd_compress.c, fileio.c, zstdcli.c) are
+      # enabled through this define ; the wrapper also needs the CUDA headers
+      CUDA_HOME := $(abspath $(dir $(NVCC))..)
+      CPPFLAGS += -DZSTD_CUDA -I$(CUDA_HOME)/include
+
+      # Target GPU architectures : default multi-gencode list, override with
+      # ZSTD_CUDA_ARCHS (comma separated, e.g. "80,86,90") or ZSTD_CUDA_ARCHS=native
+      ZSTD_CUDA_ARCHS ?= 80,86,90
+      ZSTD_CUDA_COMMA := ,
+      ifeq ($(ZSTD_CUDA_ARCHS),native)
+        NVCC_ARCH_FLAGS := -arch=native
+      else
+        NVCC_ARCH_FLAGS := $(foreach a,$(subst $(ZSTD_CUDA_COMMA), ,$(ZSTD_CUDA_ARCHS)),-gencode arch=compute_$(a)$(ZSTD_CUDA_COMMA)code=sm_$(a))
+      endif
+
+      # Add CUDA include path and library.
+      # -Wa,* flags are dropped : nvcc splits -Xcompiler arguments on commas,
+      # which breaks them for the host compiler.
+      ZSTD_CUDA_XCOMPILER_CFLAGS := $(filter-out -Wa$(ZSTD_CUDA_COMMA)--noexecstack,$(CFLAGS))
+      # expanded at parse time : LIB_SRCDIR is a recursive variable whose
+      # expansion depends on $(MAKEFILE_LIST), which make pollutes with .d
+      # dependency files before recipe execution
+      ZSTD_CUDA_NVCC_INCLUDES := -I$(LIB_SRCDIR) -I$(LIB_SRCDIR)/common -I$(LIB_SRCDIR)/compress
+      NVCCFLAGS += $(ZSTD_CUDA_NVCC_INCLUDES) $(NVCC_ARCH_FLAGS) -Xcompiler "$(ZSTD_CUDA_XCOMPILER_CFLAGS)"
+      NVCCFLAGS += -DZSTD_CUDA
 
       # Detect CUDA runtime library location
       CUDA_LIB_DIR := $(shell $(NVCC) --print-search-dirs 2>/dev/null | grep libraries | cut -d' ' -f2- | dirname)
@@ -254,23 +277,32 @@ ifneq ($(ZSTD_CUDA), 0)
       ifneq ($(CUDA_LIB_DIR),)
         NVCC_LDFLAGS += -L$(CUDA_LIB_DIR)
         LDFLAGS += -L$(CUDA_LIB_DIR)
-        LDFLAGS += -lcudart
-      else
-        # Try standard locations
-        LDFLAGS += -lcudart
+      endif
+      # CUDA runtime + C++ runtime link flags (the .cu object is C++).
+      # They must be placed AFTER the object files at link time, so they are
+      # exposed as a separate variable used by the link recipes in
+      # lib/Makefile and programs/Makefile (not merged into LDFLAGS).
+      ZSTD_CUDA_LDFLAGS := -lcudart -lstdc++ -lgcc_s
+      ifneq ($(CUDA_LIB_DIR),)
+        ZSTD_CUDA_LDFLAGS += -L$(CUDA_LIB_DIR)
       endif
 
-      # Add the .cu file to the build - it will be compiled by nvcc
-      # We need to handle .cu files specially in the Makefile
-      ZSTD_GPU_MATCH_OBJ := $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.o
+      # Add the .cu file to the build - it will be compiled by nvcc.
+      # The object is placed in the build tree (conf directory), not in the
+      # source tree. This section defines the LIB build's object; the programs
+      # build defines its own (see programs/Makefile).
+      ifeq ($(CURDIR),$(LIB_SRCDIR))
+      ZSTD_GPU_MATCH_OBJ := $(ZSTD_STATICLIB_DIR)/zstd_cuda_matchfinder.o
 
       # Rule to compile .cu file with nvcc
-      $(ZSTD_GPU_MATCH_OBJ): $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.cu
+      $(ZSTD_GPU_MATCH_OBJ): $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.cu | $(ZSTD_STATICLIB_DIR)
 		@echo "Compiling GPU match finder with nvcc"
 		$(Q)$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-      # Add the object file to the static library
+      # Add the object file to the static and dynamic libraries
       ZSTD_STATICLIB_OBJ += $(ZSTD_GPU_MATCH_OBJ)
+      ZSTD_DYNLIB_OBJ   += $(ZSTD_GPU_MATCH_OBJ)
+      endif
 
       # Add the header to the public headers
       ZSTD_COMPRESS_HEADERS += $(LIB_SRCDIR)/compress/zstd_cuda_matchfinder.h

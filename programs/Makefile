@@ -153,14 +153,24 @@ zstd:
 else
 # BUILD_DIR is defined
 
-ZSTD_OBJ := $(addprefix $(BUILD_DIR)/, $(ZSTD_ALL_OBJ))
+# GPU (CUDA) : compile the match-finder kernel into the program build tree.
+# NVCC/NVCCFLAGS come from libzstd.mk ; ZSTD_GPU_MATCH_FILES is only set when
+# the CUDA build is enabled (empty otherwise).
+ifneq ($(ZSTD_GPU_MATCH_FILES),)
+ZSTD_GPU_PROG_OBJ := $(BUILD_DIR)/zstd_cuda_matchfinder.o
+$(ZSTD_GPU_PROG_OBJ): $(ZSTD_GPU_MATCH_FILES) | $(BUILD_DIR)
+	@echo NVCC $@
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+endif
+
+ZSTD_OBJ := $(addprefix $(BUILD_DIR)/, $(ZSTD_ALL_OBJ)) $(ZSTD_GPU_PROG_OBJ)
 $(BUILD_DIR)/zstd : $(ZSTD_OBJ)
 	@echo "$(THREAD_MSG)"
 	@echo "$(ZLIB_MSG)"
 	@echo "$(LZMA_MSG)"
 	@echo "$(LZ4_MSG)"
 	@echo LINK $@
-	$(CC) $(FLAGS) $^ $(LDLIBS) -o $@$(EXT)
+	$(CC) $(FLAGS) $^ $(LDLIBS) $(ZSTD_CUDA_LDFLAGS) -o $@$(EXT)
 
 ifeq ($(HAVE_HASH),1)
 SRCBIN_HASH = $(shell cat $(BUILD_DIR)/zstd$(EXT) 2> $(VOID) | $(HASH) | cut -f 1 -d " ")
