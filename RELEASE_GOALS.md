@@ -270,9 +270,20 @@ The current single-thread kernel cannot beat the CPU. POC design (document
    CMake and make, usage (`zstd --gpu`), parameter semantics (`ZSTD_c_gpuMatchFinder`),
    POC limitations (G6 scope, no streaming/dictionary/LZDM on GPU, MT restrictions),
    and the G7 results table.
-2. Release the POC: tag `gpu-poc-0.1` on `dev` (or a dedicated branch + PR to the
-   fork's default), with a release note summarizing goals met (G1–G8) and known
+2. Release the POC: tag `dev` (or a dedicated branch + PR to the fork's
+   default), with a release note summarizing goals met (G1–G8) and known
    limitations.
+
+   **Fork release tag scheme:** the tag is the upstream version number with
+   one extra component, starting at 0: `v<M>.<m>.<r>.<n>` (e.g.
+   `v1.5.7.0` on an upstream `v1.5.7` base). `<n>` counts fork releases on
+   this upstream version: the first is `.0`, the next `.1`, and so on. When
+   upstream releases a new version and the fork rebases onto it, `<n>`
+   restarts at 0 (`v1.5.7.3` -> next upstream `v1.5.8` -> first fork release
+   is `v1.5.8.0`). The tag is annotated and pushed to the fork's origin.
+   `tests/checkTag.c` accepts this scheme: it validates only the first three
+   components against `ZSTD_VERSION_STRING` and treats anything beyond as
+   free-form.
 - **Accept:** a fresh machine with driver + toolkit follows the README to a working
   `--gpu` binary in < 15 minutes.
 
