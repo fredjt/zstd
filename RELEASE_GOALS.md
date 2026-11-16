@@ -289,6 +289,109 @@ The current single-thread kernel cannot beat the CPU. POC design (document
 
 ---
 
+## Next release: improvement targets (v1.6.0.x series)
+
+All POC goals (G1–G9) are met and tagged `v1.6.0.0` on `dev`. The list below
+targets the gaps the POC left open, in priority order; every item is about
+the GPU path itself (speed, coverage, or measurability). Baseline numbers:
+`doc/perf_results.md` (G7).
+
+Headline gaps the series must close:
+1. The GPU matchfinder only runs on the `fast` level, and there it is
+   7–30× slower than the CPU per 128 KB block. The fixed per-block cost
+   (~10 kernel launches, one `cudaStreamSynchronize`, serialized
+   H2D → compute → D2H) is ~450–500 µs vs ~40–80 µs on the CPU. G6's
+   acceptance clause (GPU ≥ CPU for match finding on 128 KB blocks) is
+   therefore not met at the only level where the GPU actually matches.
+2. The fixed 128 KB GPU block loses ratio on multi-MB inputs, because the
+   CPU context cuts larger blocks and pays the per-block literal/table
+   overhead fewer times (1 GB periodic: gpu 573 KB vs cpu 98 KB csize).
+
+### G10. Pipeline the per-block path (overlap copies and compute)
+1. Double-buffered pinned staging: while the GPU works on block N,
+   asynchronously copy block N+1 in and pick up block N's results out
+   (`cudaMemcpyAsync` on a second stream + events).
+2. Replace the per-block `cudaStreamSynchronize` with event handoff; the
+   host waits only on a results-ready event.
+- **Accept:** per-block wall time at level 1 drops ≥ 50% vs the v1.6.0.0
+  baseline (G7 harness); output byte-identical to the baseline.
+
+### G11. Batch blocks per kernel launch
+1. Process B 128 KB blocks per fill/hash/sort/search launch (grid-stride
+   over blocks with per-block table partitioning); one sync per batch
+   instead of one per block.
+2. Choose B from the device-memory budget at init (e.g. 8/16/64) with a
+   B = 1 fallback when allocation fails; document the scaling.
+- **Accept:** kernel launches per 1 GB drop ≥ 10×; level-1 end-to-end
+  speed improves ≥ 2× vs the v1.6.0.0 baseline; G5 suite passes.
+
+### G12. Prefilter candidates before the per-position count loop
+1. 8-byte equality check (two 64-bit loads) at the chain head before the
+   device commits to the per-position count loop.
+2. Skip chains whose head is older than the window before touching the
+   hash bucket at all.
+- **Accept:** search-kernel time drops ≥ 30% on both the rnd and rep 1 GB
+  sets (phase timing per G17); output identical to the baseline.
+
+### G13. Move the greedy scan onto the device
+1. A device kernel consumes the sorted candidates and performs the greedy,
+   non-overlapping, longest-in-chain-order selection (with the window),
+   writing the final sequences to a device buffer.
+2. The host only assembles the `seqStore` from a single D2H of the final
+   sequences; no per-candidate scan on the host.
+- **Accept:** the candidate-list D2H is eliminated; per-block time drops
+  ≥ 30% further; output matches the CPU greedy byte-for-byte on the G5
+  corpus.
+
+### G14. Fix the ratio penalty: GPU block size follows the CCtx
+1. Drive the GPU matchfinder with the CCtx's applied block size (up to
+   1 MB) instead of a fixed 128 KB; a 1 MB GPU block is handled as an
+   internal batch of 128 KB sub-blocks (G11) so table state tracks the
+   CPU context's block boundaries.
+2. Document the device-memory scaling per block size and cap the
+   allocation to match.
+- **Accept:** on the 1 GB periodic file at level 1, GPU csize is within
+  ~5% of CPU csize (baseline: 573 KB vs 98 KB); G5 suite passes with
+  large-block inputs.
+
+### G15. Support the greedy strategy (levels 3–4) on the GPU
+1. Implement the greedy match search on the device (searchLog/chainLog
+   from `appliedParams`) so levels 3–4 exercise the GPU path instead of
+   silently running the CPU strategy.
+2. Keep lazy/bt on the CPU; document the level → strategy mapping for
+   `--gpu` in the README.
+- **Accept:** `--gpu` at levels 3–4 provably runs device kernels (nsys);
+  ratio within ~5% of CPU greedy; end-to-end speed ≥ CPU on 1 MB+ inputs.
+
+### G16. MT support: one shared GPU matchfinder per session
+1. Allow `--multi --gpu`: worker threads submit block jobs to a bounded
+   queue against a shared GPU matchfinder; device access serialized via
+   one stream + events (or per-worker streams under a documented memory
+   budget).
+2. One window/table set per compression session (not per thread);
+   document the memory budget and the queue depth.
+- **Accept:** a 4-worker `--gpu` run passes the G5 suite, device memory
+  stays within the documented per-session budget over 100 runs, no
+  deadlock; `--multi --gpu` is at least as fast as single-thread `--gpu`.
+
+### G17. Phase-level profiling of the GPU path and refreshed numbers
+1. Opt-in `ZSTD_GPU_PHASE_TIMING` env flag: per-block phase times (H2D,
+   fill, sort, search, greedy, D2H) via CUDA events, aggregated and
+   printed at job end; wire into `tests/perf/` to emit a phase table.
+2. Re-run the G7 matrix after G10–G14; publish the phase breakdown and
+   updated end-to-end table in `doc/perf_results.md`; update the README
+   claims and the release note.
+- **Accept:** `doc/perf_results.md` carries a phase table for
+  {1 MB, 1 GB} × {rnd, rep} at level 1 plus the updated end-to-end table;
+  G6's acceptance clause (GPU ≥ CPU for match finding on 128 KB blocks)
+  is met at the `fast` level.
+
+Stretch for the release after the next (still POC non-goals below):
+streaming API (`ZSTD_compressStream*`) on the GPU path, dictionaries on
+the device, LZDM/long-range mode on the GPU.
+
+---
+
 ## Explicit non-goals for the POC
 - GPU acceleration of literals/entropy coding or decompression (match finding only).
 - Streaming API (`ZSTD_compressStream*`), dictionary compression, LZDM/long-range
@@ -299,9 +402,8 @@ The current single-thread kernel cannot beat the CPU. POC design (document
   `ZSTD_c_gpuMatchFinder` stays experimental.
 
 ## Immediate next steps (critical path)
-1. **G1** — 4-line fix to `error_private.c`; restores all CI.
-2. **G2** — exclude the wrapper from non-CUDA source lists; fixes plain `make` builds
-   (nightly + anyone without nvcc).
-3. **G3** — build wiring (C11 rewrite, `-DZSTD_CUDA`, archs, link); install nvcc.
-4. **G4** — sync + literals + window fixes; then G5 validation.
-5. **G6** — parallel kernel; then G7/G8 measurements, G9 release.
+G1–G9 are done and tagged `v1.6.0.0` (2026-11-16). The critical path for
+the next release is the level-1 speed gap: **G10** (pipeline) → **G11**
+(batching) → **G12** (prefilter) → **G13** (device greedy), then **G14**
+(ratio), **G15**/**G16** (strategy coverage / MT), and **G17** to publish
+the new numbers and tag the release.
