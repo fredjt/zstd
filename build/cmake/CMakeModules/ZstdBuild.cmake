@@ -5,6 +5,14 @@
 # Always build the library first (this defines ZSTD_BUILD_STATIC/SHARED options)
 add_subdirectory(lib)
 
+# G9 : the GPU shared library (libzstd_gpu_shared.so) is placed in the lib
+# build directory. Give targets created afterwards a build-tree RPATH so the
+# --gpu binary runs without LD_LIBRARY_PATH.
+if (ZSTD_BUILD_GPU)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)  # build tree uses the build RPATH
+    set(CMAKE_BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}/lib")
+endif()
+
 # Validate build configuration after lib options are defined
 if(ZSTD_BUILD_PROGRAMS)
     if(NOT ZSTD_BUILD_STATIC AND NOT ZSTD_PROGRAMS_LINK_SHARED)

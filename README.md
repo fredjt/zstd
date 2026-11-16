@@ -220,6 +220,53 @@ The output binary will be in `buck-out/gen/programs/`.
 
 You can integrate zstd into your Bazel project by using the module hosted on the [Bazel Central Repository](https://registry.bazel.build/modules/zstd).
 
+## GPU-accelerated match finding (POC)
+
+zstd ships an experimental, GPU-accelerated match finder (CUDA) used for the
+`ZSTD_fast` strategy class (level 1). It replaces only the match-finding
+phase; literals and entropy coding stay on the CPU.
+
+**Prerequisites** : an NVIDIA GPU driver and a CUDA toolkit with `nvcc`
+(12.x or newer, in `PATH` or as `CUDACXX`). Tested with driver 620.70,
+CUDA 13.4 and a GeForce RTX 3070 (sm_86).
+
+**Building with GNU make** (from the repository root):
+
+```sh
+make ZSTD_CUDA=1 -j$(nproc)
+```
+
+**Building with CMake** (the GPU option defaults to off):
+
+```sh
+cmake -S . -B build -DZSTD_BUILD_GPU=ON
+cmake --build build -j$(nproc)
+```
+
+The binary is `build/build/cmake/programs/zstd` (CMake) or `programs/zstd`
+(make). Both run out of the build tree without `LD_LIBRARY_PATH`.
+
+**Usage** :
+
+```sh
+zstd --gpu -1 input            # GPU match finding on the fast-strategy level
+zstd --gpu -19 input          # GPU mode, but level 19 is not fast-strategy:
+                              # compresses on the CPU (see limitations)
+```
+
+The library parameter is `ZSTD_c_gpuMatchFinder` (experimental, 0/1).
+Without a GPU (no driver, `CUDA_VISIBLE_DEVICES=` empty) or when the GPU
+match finder fails to initialize, `--gpu` prints a one-time warning on
+stderr and compresses on the CPU; the output is always a valid zstd frame.
+
+**POC limitations** (see `doc/gpu_poc_notes.md` and `doc/perf_results.md`) :
+match finding only (no GPU entropy coding, decompression, streaming API,
+dictionaries or LZDM); `ZSTD_fast` strategy only (other levels run on the
+CPU); one GPU context per process and no multi-threaded GPU usage; blocks
+are at most 128 KB. Measured speed is below the CPU at level 1 (the GPU
+match-finder is a single-threaded CUDA pipeline); see the results table in
+`doc/perf_results.md`.
+
 ## Testing
 
 You can run quick local smoke tests by running `make check`.

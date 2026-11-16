@@ -81,9 +81,12 @@ if (ZSTD_BUILD_GPU)
         # Add wrapper to main library sources (not the .cu file)
         list(APPEND ZSTD_GPU_SOURCES ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder_wrapper.c)
         
-        # Build the CUDA runtime as a separate shared library
-        add_library(zstd_gpu_shared SHARED ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder.cu)
-        target_include_directories(zstd_gpu_shared PUBLIC $<BUILD_INTERFACE:${LIBRARY_DIR}>)
+        # Build the CUDA runtime as a separate shared library.
+        # error_private.c is compiled in as well : the .cu's host section uses
+        # FORWARD_IF_ERROR, which references ERR_getErrorString at runtime.
+        add_library(zstd_gpu_shared SHARED ${LIBRARY_DIR}/compress/zstd_cuda_matchfinder.cu
+            ${LIBRARY_DIR}/common/error_private.c)
+        target_include_directories(zstd_gpu_shared PUBLIC $<BUILD_INTERFACE:${LIBRARY_DIR}> $<BUILD_INTERFACE:${LIBRARY_DIR}/common>)
         target_compile_definitions(zstd_gpu_shared PUBLIC ZSTD_CUDA)
         # Use full path to cudart to avoid linker path issues on transitive deps
         if(CUDA_cudart_LIBRARY)
