@@ -256,6 +256,43 @@ static int testFrameDecoding(const char* compressed, size_t compressedSize,
     return 0;
 }
 
+static int testDecompressBoundConcatenation(const char* compressed, size_t compressedSize)
+{
+    static const unsigned char frame[16] = {
+        0x28, 0xB5, 0x2F, 0xFD, 0xE0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0x01, 0x00, 0x00
+    };
+    unsigned char combined[sizeof(frame) + ALL_FRAMES_SIZE];
+    unsigned long long const maxBound = ZSTD_CONTENTSIZE_ERROR - 1;
+    /* The tail exercises the estimators for the actual enabled frame
+     * generations, including legacy formats when supported. */
+    unsigned long long const tailBound = ZSTD_decompressBound(compressed, compressedSize);
+    unsigned delta;
+    /* Test the last representable sum and the first rejected sum. The tail
+     * must be nonempty so each leading frame is itself representable. */
+    if (tailBound == 0 || tailBound > maxBound) {
+        DISPLAY("ERROR: Legacy frame bound %llu is outside [1, %llu]\n",
+                tailBound, maxBound);
+        return 1;
+    }
+    memcpy(combined, frame, sizeof(frame));
+    memcpy(combined + sizeof(frame), compressed, compressedSize);
+    for (delta = 0; delta < 2; ++delta) {
+        unsigned long long const headSize = maxBound - tailBound + delta;
+        unsigned long long const expected = delta == 0 ? maxBound : ZSTD_CONTENTSIZE_ERROR;
+        unsigned i;
+        for (i = 0; i < 8; ++i)
+            combined[5 + i] = (unsigned char)(headSize >> (8 * i));
+        if (ZSTD_decompressBound(combined, sizeof(frame) + compressedSize) != expected) {
+            DISPLAY("ERROR: ZSTD_decompressBound accepted an unrepresentable concatenated bound\n");
+            return 1;
+        }
+    }
+    DISPLAY("Legacy bound concatenation OK\n");
+    return 0;
+}
+
 static int testDictionaryAPI(unsigned version,
                              const char* compressed, size_t compressedSize,
                              const void* dict, size_t dictSize)
@@ -446,6 +483,395 @@ static int testMultipleDDicts(void)
 }
 #endif
 
+#if (ZSTD_LEGACY_SUPPORT <= 2)
+/* Build a real v0.1/v0.2 frame with optional raw history, raw literals, and
+ * caller-supplied sequence headers/bitstream. The two versions use different
+ * frame magic and literal headers, but the sequence encoding is identical.
+ * This deliberately tiny encoder writes only the low byte of each size field.
+ * Return 0 rather than silently truncating an unsupported size. */
+static size_t buildLegacyOffsetFrame(unsigned char* dst, size_t dstCapacity,
+                                     unsigned version,
+                                     unsigned prefixSize, unsigned litSize,
+                                     const unsigned char* sequences, size_t seqSize)
+{
+    size_t pos = 4;
+    size_t blockHeader;
+    size_t payloadSize;
+    size_t prefixBlockSize;
+    if ((version != 1 && version != 2) || prefixSize > 255 || litSize > 252
+        || (version == 2 && litSize >= 64)
+        || seqSize > 255 - 3 - litSize) {
+        return 0;
+    }
+    payloadSize = 3 + litSize + seqSize;
+    prefixBlockSize = prefixSize == 0 ? 0 : 3 + prefixSize;
+    if (dstCapacity < 4 + prefixBlockSize + 3 + payloadSize + 3) return 0;
+    if (version == 1) {
+        dst[0] = 0xFD; dst[1] = 0x2F; dst[2] = 0xB5; dst[3] = 0x1E;
+    } else {
+        dst[0] = 0x22; dst[1] = 0xB5; dst[2] = 0x2F; dst[3] = 0xFD;
+    }
+    if (prefixSize != 0) {
+        dst[pos++] = 0x40; dst[pos++] = 0; dst[pos++] = (unsigned char)prefixSize;
+        memset(dst + pos, 'P', prefixSize);
+        pos += prefixSize;
+    }
+    blockHeader = pos;
+    pos += 3;
+    if (version == 1) {
+        dst[pos++] = 0x40; dst[pos++] = 0; dst[pos++] = (unsigned char)litSize;
+    } else {
+        /* v0.2: LE24 (literal size << 2) | raw type 1. The size limit
+         * above keeps both high bytes zero. */
+        dst[pos++] = (unsigned char)((litSize << 2) | 1);
+        dst[pos++] = 0; dst[pos++] = 0;
+    }
+    memset(dst + pos, 'A', litSize);
+    pos += litSize;
+    memcpy(dst + pos, sequences, seqSize);
+    pos += seqSize;
+    dst[blockHeader] = 0;
+    dst[blockHeader + 1] = 0;
+    dst[blockHeader + 2] = (unsigned char)payloadSize;
+    dst[pos++] = 0xC0; dst[pos++] = 0; dst[pos++] = 0;
+    return pos;
+}
+#endif
+
+static int testLegacyZeroOffsets(void)
+{
+#if (ZSTD_LEGACY_SUPPORT <= 2)
+    /* Sequence section: LE16 nbSeq, table modes, one-byte dumps length,
+     * serialized table symbols, then the reverse bitstream.
+     * 0xA8 selects RLE LL/offset/ML tables, whose symbols follow in that order.
+     * 0x98 selects RLE LL/ML and a raw offset table, so only LL/ML symbols are
+     * stored before the bitstream. That bitstream can switch offset symbols
+     * from explicit distance 1 to the historical repeat code 0. ML code 4
+     * means an eight-byte match. */
+    static const unsigned char firstZero[] = { 1, 0, 0xA8, 0, 8, 0, 4, 1 };
+    static const unsigned char laterZero[] = { 2, 0, 0xA8, 0, 0, 0, 4, 1 };
+    static const unsigned char initialRepeat[] = { 1, 0, 0xA8, 0, 0, 0, 4, 1 };
+    static const unsigned char explicitOffset[] = { 1, 0, 0xA8, 0, 8, 1, 4, 1 };
+    static const unsigned char laterRepeat[] = { 2, 0, 0x98, 0, 8, 4, 0, 0x84 };
+    static const unsigned char laterZeroLiteralRepeat[] = { 3, 0, 0x98, 0, 0, 4, 0, 0x84, 0x10 };
+    static const struct {
+        const char* name;
+        unsigned prefixSize;
+        unsigned litSize;
+        const unsigned char* sequences;
+        size_t seqSize;
+        size_t expectedSize;  /* zero means corruption_detected is expected */
+        unsigned char expectedByte;
+    } cases[] = {
+        { "first zero offset", 0, 8, firstZero, sizeof(firstZero), 0, 0 },
+        { "later zero offset", 8, 0, laterZero, sizeof(laterZero), 0, 0 },
+        { "initial repeat", 8, 0, initialRepeat, sizeof(initialRepeat), 16, 'P' },
+        { "explicit offset", 0, 8, explicitOffset, sizeof(explicitOffset), 16, 'A' },
+        { "later repeat", 0, 16, laterRepeat, sizeof(laterRepeat), 32, 'A' },
+        { "later zero-literal repeat", 8, 0, laterZeroLiteralRepeat,
+          sizeof(laterZeroLiteralRepeat), 32, 'P' }
+    };
+    unsigned char frame[128];
+    unsigned char output[128];
+    unsigned version;
+    size_t c;
+    unsigned pattern;
+    int failed = 0;
+
+    /* The file-level 0-to-8 normalization makes this start at 1 or 2. */
+    for (version = ZSTD_LEGACY_SUPPORT; version <= 2; ++version) {
+        for (c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+            size_t const frameSize = buildLegacyOffsetFrame(frame, sizeof(frame), version,
+                    cases[c].prefixSize, cases[c].litSize,
+                    cases[c].sequences, cases[c].seqSize);
+            if (frameSize == 0) {
+                DISPLAY("ERROR: v0.%u %s exceeds tiny frame builder limits\n",
+                        version, cases[c].name);
+                return 1;
+            }
+            for (pattern = 0; pattern < 2; ++pattern) {
+                size_t ret;
+                size_t i;
+                memset(output, pattern ? 0xDE : 0xA5, sizeof(output));
+                ret = ZSTD_decompress(output, sizeof(output), frame, frameSize);
+                if (cases[c].expectedSize == 0) {
+                    if (ZSTD_getErrorCode(ret) != ZSTD_error_corruption_detected) {
+                        DISPLAY("ERROR: v0.%u %s accepted: %s (%zu)\n",
+                                version, cases[c].name, ZSTD_getErrorName(ret), ret);
+                        failed = 1;
+                    }
+                    continue;
+                }
+                if (ret != cases[c].expectedSize) {
+                    DISPLAY("ERROR: v0.%u %s: %s (%zu)\n",
+                            version, cases[c].name, ZSTD_getErrorName(ret), ret);
+                    failed = 1;
+                    continue;
+                }
+                for (i = 0; i < ret; ++i) {
+                    if (output[i] != cases[c].expectedByte) {
+                        DISPLAY("ERROR: v0.%u %s: wrong output at %zu\n",
+                                version, cases[c].name, i);
+                        failed = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (failed) return 1;
+    DISPLAY("Legacy zero-offset checks OK\n");
+#endif
+    return 0;
+}
+
+#if (ZSTD_LEGACY_SUPPORT <= 7)
+/* All these formats have a 128-KB decoded block limit. The three-byte
+ * block-size field can represent more, so test that oversized blocks are
+ * rejected by size inspection and by the decoder. */
+#define LEGACY_BLOCK_LIMIT (128U * 1024U)
+
+static size_t buildLegacyBlockFrame(unsigned char* dst, unsigned version,
+                                    unsigned type, size_t blockSize)
+{
+    size_t const headerSize = version < 4 ? 4 : version == 7 ? 6 : 5;
+    size_t const payloadSize = type == 2 ? 1 : blockSize;
+    if (version == 1) {
+        dst[0] = 0xFD; dst[1] = 0x2F; dst[2] = 0xB5; dst[3] = 0x1E;
+    } else {
+        dst[0] = (unsigned char)(0x20 + version);
+        dst[1] = 0xB5; dst[2] = 0x2F; dst[3] = 0xFD;
+    }
+    if (version >= 4) dst[4] = version == 6 ? 5 : 0;
+    if (version == 7) dst[5] = 0x38; /* 128-KB window, unknown content size */
+    dst[headerSize] = (unsigned char)((type << 6) | ((blockSize >> 16) & 7));
+    dst[headerSize + 1] = (unsigned char)(blockSize >> 8);
+    dst[headerSize + 2] = (unsigned char)blockSize;
+    memset(dst + headerSize + 3, 'X', payloadSize);
+    dst[headerSize + 3 + payloadSize] = 0xC0;
+    dst[headerSize + 4 + payloadSize] = 0;
+    dst[headerSize + 5 + payloadSize] = 0;
+    return headerSize + 6 + payloadSize;
+}
+#endif
+
+static int testLegacyBlockBounds(void)
+{
+#if (ZSTD_LEGACY_SUPPORT <= 7)
+    size_t const sizes[] = { LEGACY_BLOCK_LIMIT - 1, LEGACY_BLOCK_LIMIT,
+                            LEGACY_BLOCK_LIMIT + 1, 2 * LEGACY_BLOCK_LIMIT, 524287 };
+    unsigned char* const src = (unsigned char*)malloc(2 * (524287 + 12));
+    unsigned char* const decoded = (unsigned char*)malloc(524287 + 1);
+    unsigned version, type;
+    size_t s;
+    int failed = 1;
+    if (src == NULL || decoded == NULL) goto cleanup;
+    for (version = ZSTD_LEGACY_SUPPORT; version <= 7; ++version) {
+        for (type = 0; type < 3; ++type) {
+            for (s = 0; s < sizeof(sizes) / sizeof(sizes[0]); ++s) {
+                size_t const size = sizes[s];
+                int const reject = size > LEGACY_BLOCK_LIMIT;
+                size_t const srcSize = buildLegacyBlockFrame(src, version, type, size);
+                size_t const cSize = ZSTD_findFrameCompressedSize(src, srcSize);
+                unsigned long long const bound = ZSTD_decompressBound(src, srcSize);
+                if (reject) {
+                    if (ZSTD_getErrorCode(cSize) != ZSTD_error_corruption_detected
+                        || bound != ZSTD_CONTENTSIZE_ERROR) goto mismatch;
+                    if (ZSTD_getErrorCode(ZSTD_decompress(decoded, 524287 + 1, src, srcSize))
+                        != ZSTD_error_corruption_detected) goto mismatch;
+                } else {
+                    if (cSize != srcSize || bound != LEGACY_BLOCK_LIMIT) goto mismatch;
+                    /* Only decode raw blocks here: the compressed payload is
+                     * arbitrary 'X' bytes, and not all early versions support RLE. */
+                    if (type == 1) {
+                        size_t const result = ZSTD_decompress(decoded, 524287 + 1, src, srcSize);
+                        if (result != size || decoded[0] != 'X'
+                            || decoded[size - 1] != 'X') goto mismatch;
+                    }
+                }
+                continue;
+mismatch:
+                DISPLAY("ERROR: v0.%u block type %u size %u violates block bound\n",
+                        version, type, (unsigned)size);
+                goto cleanup;
+            }
+        }
+        {   size_t const first = buildLegacyBlockFrame(src, version, 1, LEGACY_BLOCK_LIMIT);
+            size_t const second = buildLegacyBlockFrame(src + first, version, 1, 1);
+            size_t const result = ZSTD_decompress(decoded, 524287 + 1, src, first + second);
+            if (ZSTD_decompressBound(src, first + second) != 2ULL * LEGACY_BLOCK_LIMIT
+                || result != LEGACY_BLOCK_LIMIT + 1) {
+                DISPLAY("ERROR: v0.%u concatenated raw frames violate block bound\n", version);
+                goto cleanup;
+            }
+            if (ZSTD_getErrorCode(ZSTD_decompress(decoded, LEGACY_BLOCK_LIMIT - 1,
+                                                  src, first)) != ZSTD_error_dstSize_tooSmall) {
+                DISPLAY("ERROR: v0.%u raw block accepted an undersized destination\n", version);
+                goto cleanup;
+            }
+        }
+    }
+    failed = 0;
+cleanup:
+    free(decoded);
+    free(src);
+    if (failed) DISPLAY("ERROR: Legacy block-size bound regression\n");
+    return failed;
+#else
+    return 0;
+#endif
+}
+
+#if (ZSTD_LEGACY_SUPPORT <= 4)
+static size_t buildLegacyRawLiteralsFrame(unsigned char* dst, unsigned version,
+                                          size_t litSize, unsigned extraDump)
+{
+    size_t const headerSize = version < 4 ? 4 : 5;
+    size_t const blockSize = litSize + 10 + extraDump;
+    size_t const frameSize = buildLegacyBlockFrame(dst, version, 0, blockSize);
+    unsigned char* const block = dst + headerSize + 3;
+    unsigned char* seq = block + 3 + litSize;
+    size_t i;
+    block[0] = (unsigned char)((litSize << 2) | 1);
+    block[1] = (unsigned char)(litSize >> 6);
+    block[2] = (unsigned char)(litSize >> 14);
+    for (i = 0; i < litSize; ++i) block[3 + i] = (unsigned char)('A' + i);
+    seq[0] = 0; seq[1] = 0; /* no sequences */
+    seq[2] = 0x54;         /* raw LL/OF/ML tables */
+    seq[3] = (unsigned char)extraDump;
+    if (extraDump) { seq[4] = 0; ++seq; }
+    seq[4] = 0; seq[5] = 0; seq[6] = 4; /* 18 initial-state bits */
+    return frameSize;
+}
+#endif
+
+static int testLegacyRawLiteralOffsets(void)
+{
+#if (ZSTD_LEGACY_SUPPORT <= 4)
+    unsigned version;
+    size_t const sizes[] = { 1, 4, 8, 16 };
+    unsigned char frame[64];
+    unsigned char decoded[32];
+    unsigned char expected[32];
+    for (version = ZSTD_LEGACY_SUPPORT < 2 ? 2 : ZSTD_LEGACY_SUPPORT; version <= 4; ++version) {
+        unsigned extraDump;
+        size_t s;
+        for (extraDump = 0; extraDump <= 1; ++extraDump) {
+            for (s = 0; s < sizeof(sizes) / sizeof(sizes[0]); ++s) {
+                size_t const litSize = sizes[s];
+                size_t const frameSize = buildLegacyRawLiteralsFrame(frame, version, litSize, extraDump);
+                size_t i;
+                size_t result;
+                for (i = 0; i < litSize; ++i) expected[i] = (unsigned char)('A' + i);
+                result = ZSTD_decompress(decoded, sizeof(decoded), frame, frameSize);
+                if (result != litSize || memcmp(decoded, expected, litSize) != 0) {
+                    DISPLAY("ERROR: v0.%u raw literals size %u, extra dump %u\n",
+                            version, (unsigned)litSize, extraDump);
+                    return 1;
+                }
+                /* A declared literal payload extending past the block must
+                 * still fail before the temporary-buffer copy. */
+                {   size_t const headerSize = version < 4 ? 4 : 5;
+                    size_t const badLitSize = litSize + 8 + extraDump;
+                    frame[headerSize + 3] = (unsigned char)((badLitSize << 2) | 1);
+                    frame[headerSize + 4] = (unsigned char)(badLitSize >> 6);
+                    frame[headerSize + 5] = (unsigned char)(badLitSize >> 14);
+                    result = ZSTD_decompress(decoded, sizeof(decoded), frame, frameSize);
+                    if (ZSTD_getErrorCode(result) != ZSTD_error_corruption_detected) {
+                        DISPLAY("ERROR: v0.%u accepted truncated raw literals\n", version);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+#endif
+    return 0;
+}
+
+#if (ZSTD_LEGACY_SUPPORT <= 5)
+/* Build a v0.4 or v0.5 frame with windowLog 11 (2 KB), and its decoded content :
+ * a raw block of prefixSize bytes, then a compressed block whose only sequence
+ * copies 4 bytes from offset 1000, inside the raw block, after 500 literals.
+ * It ends with 16 literals: the one-shot decoder wants room after the last match.
+ * The streaming decoder wraps its output buffer between the two blocks. */
+static size_t buildWrapFrame(unsigned version, unsigned char* dst, unsigned char* expected,
+                             size_t* expectedSize, unsigned prefixSize)
+{
+    /* Sequence section: nbSeq 1 (LE16 in v0.4), then RLE LL/offset/ML tables
+     * (0xA8 in v0.4, 0x54 in v0.5) and the dumps.
+     * The dumps hold litLength 500: 255, then LE24 500 (v0.4) or LE16 500<<1 (v0.5).
+     * Table symbols: LL 63 (read the dumps), offset code 10 (512 + 9 bits), ML 0 (MINMATCH).
+     * Bitstream: the 9 offset bits (1000 - 512) under the stop bit. */
+    static const unsigned char sequencesV04[] = { 1, 0, 0xA8, 4, 255, 0xF4, 0x01, 0, 63, 10, 0, 0xE8, 0x03 };
+    static const unsigned char sequencesV05[] = { 1, 0x54, 3, 255, 0xE8, 0x03, 63, 10, 0, 0xE8, 0x03 };
+    const unsigned char* const sequences = (version == 4) ? sequencesV04 : sequencesV05;
+    size_t const seqSize = (version == 4) ? sizeof(sequencesV04) : sizeof(sequencesV05);
+    unsigned const litLength = 500;
+    unsigned const litSize = litLength + 16;
+    size_t const blockSize = ((version == 4) ? 3 : 2) + litSize + seqSize;
+    unsigned char* op = expected + prefixSize;
+    unsigned char* lits;
+    size_t pos = 0;
+    unsigned i;
+    dst[pos++] = (unsigned char)(0x20 + version);  /* magic */
+    dst[pos++] = 0xB5; dst[pos++] = 0x2F; dst[pos++] = 0xFD;
+    dst[pos++] = 0;  /* windowLog 11 */
+    dst[pos++] = (unsigned char)(0x40 | (prefixSize >> 16));  /* raw block */
+    dst[pos++] = (unsigned char)(prefixSize >> 8);
+    dst[pos++] = (unsigned char)prefixSize;
+    for (i = 0; i < prefixSize; i++) expected[i] = dst[pos++] = (unsigned char)i;
+    dst[pos++] = (unsigned char)(blockSize >> 16);  /* compressed block */
+    dst[pos++] = (unsigned char)(blockSize >> 8);
+    dst[pos++] = (unsigned char)blockSize;
+    if (version == 4) {  /* raw literals: LE24 (litSize << 2) | 1 */
+        dst[pos++] = (unsigned char)((litSize << 2) | 1);
+        dst[pos++] = (unsigned char)(litSize >> 6);
+        dst[pos++] = (unsigned char)(litSize >> 14);
+    } else {  /* raw literals, 2-byte header */
+        dst[pos++] = (unsigned char)(0xA0 | (litSize >> 8));
+        dst[pos++] = (unsigned char)litSize;
+    }
+    lits = dst + pos;
+    for (i = 0; i < litSize; i++) lits[i] = (unsigned char)(i * 7 + 3);  /* differ from the raw block */
+    pos += litSize;
+    memcpy(dst + pos, sequences, seqSize);
+    pos += seqSize;
+    dst[pos++] = 0xC0; dst[pos++] = 0; dst[pos++] = 0;  /* end of frame */
+
+    memcpy(op, lits, litLength);
+    op += litLength;
+    for (i = 0; i < 4; i++, op++) *op = op[-1000];
+    memcpy(op, lits + litLength, litSize - litLength);
+    op += litSize - litLength;
+    *expectedSize = (size_t)(op - expected);
+    return pos;
+}
+
+static int testStreamingWrap(void)
+{
+    /* 600: the second block overwrites history that its match still reads
+     *      (#4553 in v0.5, the same flaw in v0.4).
+     * 2048: the raw block fills the window, and the v0.5 streaming decoder used to
+     *       keep no room for the next block (regression from the #4553 fix). */
+    static const unsigned prefixSizes[] = { 600, 2048 };
+    unsigned char frame[3000];
+    unsigned char expected[3000];
+    unsigned version;
+    size_t i;
+    for (version = (ZSTD_LEGACY_SUPPORT < 4) ? 4 : ZSTD_LEGACY_SUPPORT; version <= 5; ++version) {
+        for (i = 0; i < sizeof(prefixSizes) / sizeof(prefixSizes[0]); ++i) {
+            size_t expectedSize;
+            size_t const frameSize = buildWrapFrame(version, frame, expected, &expectedSize, prefixSizes[i]);
+            DISPLAY("v0.%u streaming wrap, %u-byte first block\n", version, prefixSizes[i]);
+            if (testSimpleAPI((const char*)frame, frameSize, (const char*)expected, expectedSize)) return 1;
+            if (testStreamingAPI((const char*)frame, frameSize, (const char*)expected, expectedSize)) return 1;
+        }
+    }
+    return 0;
+}
+#endif
+
 int main(void)
 {
     size_t const blockSize = strlen(BLOCK);
@@ -484,6 +910,7 @@ int main(void)
 
         if (testSimpleAPI(compressed, compressedSize, expected, expectedSize)) break;
         if (testFrameDecoding(compressed, compressedSize, expectedSize)) break;
+        if (testDecompressBoundConcatenation(compressed, compressedSize)) break;
         /* all blocks being identical, the first @nbStreamFrames ones
          * are what the streaming subset must decode to */
         if (testStreamingAPI(streamable, streamableSize,
@@ -491,6 +918,12 @@ int main(void)
         if (testLegacyDictionaries()) break;
 #if (ZSTD_LEGACY_SUPPORT <= 7)
         if (testMultipleDDicts()) break;
+#endif
+        if (testLegacyZeroOffsets()) break;
+        if (testLegacyBlockBounds()) break;
+        if (testLegacyRawLiteralOffsets()) break;
+#if (ZSTD_LEGACY_SUPPORT <= 5)
+        if (testStreamingWrap()) break;
 #endif
         result = 0;
     } while (0);

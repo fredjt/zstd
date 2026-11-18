@@ -16,6 +16,12 @@ datagen() {
     "$DATAGEN_BIN" "$@"
 }
 
+# zstd is an alias rather than a function: POSIX doesn't require "VAR=value function"
+# to export VAR to the commands run by the function.
+# bash only expands aliases in a script in POSIX mode (started as sh), or with expand_aliases.
+# Without it (e.g. `bash playTests.sh`), zstd would silently run the zstd found in PATH.
+# shellcheck disable=SC2039,SC3044 # shopt only runs in bash
+if [ -n "${BASH_VERSION-}" ]; then shopt -s expand_aliases; fi
 alias zstd='$EXE_PREFIX $ZSTD_BIN'
 
 sudoZstd() {
@@ -111,6 +117,15 @@ case "$OS" in
     DEVDEVICE="NUL"
     ;;
 esac
+
+# Native Windows builds (MSVC, MinGW) define _WIN32; Cygwin builds don't
+isNativeWindows=false
+if [ "$isWindows" = true ]; then
+  case "$UNAME" in
+    CYGWIN*) ;;
+    *) isNativeWindows=true ;;
+  esac
+fi
 
 case "$UNAME" in
   Darwin) MD5SUM="md5 -r" ;;
@@ -247,6 +262,17 @@ test -f tmpOut   # file must be created
 rm -f tmpCompressed
 zstd tmp -o tmpOut -c > tmpCompressed
 test -f tmpCompressed   # file must be created
+
+println "test : refuse output overwriting input through another spelling"
+cp tmp tmpRef
+zstd -f tmp -o ./tmp && die "should have refused to overwrite input through ./ prefix"
+cmp tmp tmpRef || die "refused ./ output modified the input file"
+if [ "$isWindows" = true ] ; then
+    println "test : refuse output overwriting input through a different case"
+    zstd -f tmp -o TMP && die "should have refused to overwrite input through a different case"
+    cmp tmp tmpRef || die "refused differently-cased output modified the input file"
+fi
+rm -f tmpRef
 
 println "test : forgotten argument"
 cp tmp tmp2
@@ -834,6 +860,25 @@ ln -s tmp_fileList tmp_symLink
 zstd -f --filelist=tmp_symLink
 test -f tmp2.zst
 test -f tmp1.zst
+
+println "test : file list with CR at the end of lines, --filelist=FILE"
+# The list is read in binary mode. Native Windows builds drop the CR of CRLF line endings;
+# other builds keep it, since CR is a valid filename character there.
+rm -f *.zst
+if [ "$isNativeWindows" = true ]; then
+    printf 'tmp1\r\ntmp2\r\n' > tmp_crList
+    zstd -f --filelist=tmp_crList
+    test -f tmp1.zst
+    test -f tmp2.zst
+else
+    CR=$(printf '\r')
+    echo "CR" > "tmpCR$CR"
+    printf 'tmpCR\r\n' > tmp_crList
+    zstd -f --filelist=tmp_crList
+    test -f "tmpCR$CR.zst"
+    rm -f "tmpCR$CR" "tmpCR$CR.zst"
+fi
+rm -f tmp_crList
 
 println "test : compress multiple files reading them from multiple files, --filelist=FILE"
 rm -f *.zst
