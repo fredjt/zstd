@@ -40,7 +40,6 @@
  * tradeoffs vs. the CPU match finder.
  */
 
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -197,9 +196,13 @@ __global__ void gpuRadixScanL2(const unsigned* __restrict__ d_groupTotal,
     }
 }
 
-/* Scatter: place each key into d_keysB at its sorted position.
+/* Stable scatter: place each key into d_keysB at its sorted position.
  * dst = digitStart[d] + groupPrefix[g][d] + blockStartLocal[cb][d] + localRank.
- * The local rank within (cb, d) is an atomic counter (zeroed per pass). */
+ * The localRank is the rank of this key within (cb, d) *in input order*, so
+ * the LSD radix sort is stable and the low (position) bits stay ordered
+ * within each hash row. Each thread owns exactly one input element in
+ * thread-index (input) order, so the rank is the number of lower-indexed
+ * threads in this block that carry the same digit. */
 __global__ void gpuRadixScatter(const unsigned long long* __restrict__ d_keys,
                                 unsigned bitOffset, unsigned totalPos,
                                 const unsigned* __restrict__ d_digitStart,
@@ -208,15 +211,24 @@ __global__ void gpuRadixScatter(const unsigned long long* __restrict__ d_keys,
                                 unsigned* __restrict__ d_blockCounter,
                                 unsigned long long* __restrict__ d_keysB)
 {
+    __shared__ unsigned s_digit[256];
     unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= totalPos) return;
-    unsigned long long const key = d_keys[t];
-    unsigned const d = (unsigned)((key >> bitOffset) & 255);
-    {
+    unsigned long long key = 0;
+    unsigned dd = 0xFFu;   /* sentinel: never matches a real digit */
+    if (t < totalPos) {
+        key = d_keys[t];
+        dd = (unsigned)((key >> bitOffset) & 255);
+    }
+    s_digit[threadIdx.x] = dd;
+    __syncthreads();
+    if (t < totalPos) {
+        unsigned localRank = 0;
+        for (unsigned j = 0; j < threadIdx.x; j++) {
+            if (s_digit[j] == dd) localRank++;
+        }
         unsigned const g = blockIdx.x / 256;
-        unsigned const localRank = atomicAdd(&d_blockCounter[blockIdx.x * 256 + d], 1);
-        unsigned const dst = d_digitStart[d] + d_groupPrefix[g * 256 + d]
-                           + d_blockStartLocal[blockIdx.x * 256 + d] + localRank;
+        unsigned const dst = d_digitStart[dd] + d_groupPrefix[g * 256 + dd]
+                           + d_blockStartLocal[blockIdx.x * 256 + dd] + localRank;
         d_keysB[dst] = key;
     }
 }

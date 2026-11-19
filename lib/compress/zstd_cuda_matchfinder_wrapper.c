@@ -18,8 +18,6 @@
  * - Integration with ZSTD_buildSeqStore for GPU-accelerated compression
  */
 
-#include <stdio.h>
-
 #include "zstd_compress_internal.h"
 #include "zstd_cuda_matchfinder.h"
 
