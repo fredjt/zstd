@@ -13,7 +13,7 @@
  * @brief C wrapper for GPU-accelerated match finding in zstd.
  *
  * This file provides the C interface that bridges the CUDA implementation
- * with zstd\'s internal compression flow. It handles:
+ * with zstd's internal compression flow. It handles:
  * - GPU context management (creation, initialization, destruction)
  * - Integration with ZSTD_buildSeqStore for GPU-accelerated compression
  */
@@ -53,27 +53,21 @@ static void ZSTD_storeLastLiterals_gpu(SeqStore_t* seqStorePtr, const BYTE* anch
 size_t ZSTD_initGpuMatchFinderForCtx(ZSTD_CCtx* zc)
 {
     ZSTD_GpuCompressionParameters gpuParams = {0};
-    /* Use ZSTD_BLOCKSIZE_MAX as the default block size */
-    size_t const srcSize = ZSTD_BLOCKSIZE_MAX;
 
     if (!zc) return ERROR(GPU_invalidParameter);
 
     /* Configure GPU parameters from CCtx params */
-    gpuParams.hashLog = zc->appliedParams.cParams.hashLog;
-    gpuParams.chainLog = zc->appliedParams.cParams.chainLog;
+    gpuParams.hashLog   = zc->appliedParams.cParams.hashLog;
+    gpuParams.chainLog  = zc->appliedParams.cParams.chainLog;
     gpuParams.searchLog = zc->appliedParams.cParams.searchLog;
-    gpuParams.minMatch = zc->appliedParams.cParams.minMatch;
-    gpuParams.strategy = (unsigned) zc->appliedParams.cParams.strategy;
-
+    gpuParams.minMatch  = zc->appliedParams.cParams.minMatch;
+    gpuParams.strategy  = (unsigned) zc->appliedParams.cParams.strategy;
+    gpuParams.windowLog = zc->appliedParams.cParams.windowLog;
 
     /* Create GPU match finder - delegate to .cu implementation */
     {
-        size_t const err = ZSTD_createGpuMatchFinder((ZSTD_GpuMatchFinder**) &zc->gpuMF, &gpuParams, srcSize);
+        size_t const err = ZSTD_createGpuMatchFinder((ZSTD_GpuMatchFinder**) &zc->gpuMF, &gpuParams, ZSTD_BLOCKSIZE_MAX);
         FORWARD_IF_ERROR(err, "GPU match finder creation failed");
-        /* Enforce the CCtx compression window in the kernel (the kernel skips
-         * candidates further away than this window). The window is always a
-         * power of two : 2^windowLog. */
-        ((ZSTD_GpuMatchFinder*) zc->gpuMF)->windowSize = (size_t) (1ULL << zc->appliedParams.cParams.windowLog);
     }
     return 0;
 }
@@ -96,13 +90,10 @@ int ZSTD_shouldUseGpu(ZSTD_CCtx const* zc)
 /**
  * GPU-accelerated version of ZSTD_buildSeqStore.
  *
- * This function replaces the CPU match finding with GPU match finding.
- * It delegates to ZSTD_compressBlock_gpu (from .cu file) which:
- * 1. Copies the input data to GPU memory
- * 2. Runs the GPU match finder kernel
- * 3. Converts GPU results to ZSTD_Sequence format
- *
- * Then this function converts ZSTD_Sequence to SeqDef format for zstd.
+ * Runs the GPU match finder (a single-block batch) for the block, then
+ * converts the returned (position, offset, matchLength) sequences into the
+ * SeqStore format (literal runs + sequences) exactly like the CPU
+ * matchfinders do.
  */
 size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSize)
 {
@@ -127,7 +118,7 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
     const size_t maxNbSeq = zc->seqStore.maxNbSeq;
 
     /* Allocate sequence buffer */
-    ZSTD_Sequence* seqs = malloc(maxNbSeq * sizeof(ZSTD_Sequence));
+    ZSTD_GpuSequence* seqs = (ZSTD_GpuSequence*)malloc(maxNbSeq * sizeof(ZSTD_GpuSequence));
     if (!seqs) return ERROR(GPU_allocationFailed);
 
     /* The GPU always emits raw offsets (rep = 0) : repcodes are not used,
@@ -135,70 +126,72 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
     rep[0] = rep[1] = rep[2] = 0;
 
     /* Run GPU match finding - delegates to .cu implementation */
-    const size_t nbSeq = ZSTD_compressBlock_gpu(gpuMF, seqs, maxNbSeq, src, srcSize, rep, rep);
+    const size_t nbSeq = ZSTD_compressBlock_gpu(gpuMF, (ZSTD_Sequence*)seqs, maxNbSeq, src, srcSize, rep, rep);
     if (ZSTD_isError(nbSeq))
     {
         free(seqs);
         return nbSeq;
     }
 
-    /* Convert ZSTD_Sequence to SeqDef format and write to sequence store */
+    /* Convert (position, offset, matchLength) to SeqDef format and write to
+     * the sequence store. Each sequence owns the literals before its match
+     * (litLength = position - previousEnd), and the block's tail is one last
+     * literal run. */
     ZSTD_resetSeqStore(&zc->seqStore);
 
-    /* Handle the no-match case: store all data as literals */
+    /* Handle the no-match case: store all data as literals. */
     if (nbSeq == 0)
     {
-        /* No matches found - all data is literals.
-         * The entire src block is trailing literals, so the anchor is src itself. */
         ZSTD_storeLastLiterals_gpu(&zc->seqStore, (const BYTE*) src, srcSize);
         free(seqs);
         return ZSTDbss_compress;
     }
 
-    for (i = 0; i < nbSeq; i++)
     {
-        SeqDef* const seq = zc->seqStore.sequences + i;
-        /* Long-length tracking, exactly like the CPU ZSTD_storeSeqOnly() :
-         * a match longer than 65535 + MINMATCH (or a literal run longer than
-         * 65535) does not fit in the U16 field. The encoder recovers the full
-         * length from longLengthPos/longLengthType. A block is at most 128 KB
-         * and matches are non-overlapping, so at most one long length exists. */
-        if (seqs[i].litLength > 0xFFFF)
-        {
-            assert(zc->seqStore.longLengthType == ZSTD_llt_none);
-            zc->seqStore.longLengthType = ZSTD_llt_literalLength;
-            zc->seqStore.longLengthPos = (U32) i;
-        }
-        seq->litLength = (U16) seqs[i].litLength;
-        {
-            size_t const mlBase = seqs[i].matchLength - MINMATCH;
-            if (mlBase > 0xFFFF)
-            {
-                assert(zc->seqStore.longLengthType == ZSTD_llt_none);
-                zc->seqStore.longLengthType = ZSTD_llt_matchLength;
-                zc->seqStore.longLengthPos = (U32) i;
-            }
-            seq->mlBase = (U16) mlBase;
-        }
-        /* GPU stores raw offset (distance); zstd format requires offBase = offset + ZSTD_REP_NUM */
-        seq->offBase = seqs[i].offset + ZSTD_REP_NUM;
-    }
-
-    /* Copy literal runs and trailing literals into the sequence store, the
-     * same way the CPU matchfinders do : each sequence owns the literals
-     * before its match, and the block's tail is one last literal run. */
-    {
+        size_t prevEnd = 0;
         const BYTE* const srcB = (const BYTE*) src;
-        size_t pos = 0;
         for (i = 0; i < nbSeq; i++)
         {
-            ZSTD_memcpy(zc->seqStore.lit, srcB + pos, seqs[i].litLength);
-            zc->seqStore.lit += seqs[i].litLength;
-            pos += seqs[i].litLength + seqs[i].matchLength;
+            SeqDef* const seq = zc->seqStore.sequences + i;
+            size_t const pos = seqs[i].position;
+            size_t const litLength = pos - prevEnd;
+
+            /* Long-length tracking, exactly like the CPU ZSTD_storeSeqOnly() :
+             * a match longer than 65535 + MINMATCH (or a literal run longer
+             * than 65535) does not fit in the U16 field. The encoder recovers
+             * the full length from longLengthPos/longLengthType. A block is at
+             * most 128 KB and matches are non-overlapping, so at most one long
+             * length exists. */
+            if (litLength > 0xFFFF)
+            {
+                assert(zc->seqStore.longLengthType == ZSTD_llt_none);
+                zc->seqStore.longLengthType = ZSTD_llt_literalLength;
+                zc->seqStore.longLengthPos = (U32) i;
+            }
+            seq->litLength = (U16) litLength;
+            {
+                size_t const mlBase = seqs[i].matchLength - MINMATCH;
+                if (mlBase > 0xFFFF)
+                {
+                    assert(zc->seqStore.longLengthType == ZSTD_llt_none);
+                    zc->seqStore.longLengthType = ZSTD_llt_matchLength;
+                    zc->seqStore.longLengthPos = (U32) i;
+                }
+                seq->mlBase = (U16) mlBase;
+            }
+            /* GPU stores raw offset (distance); zstd format requires
+             * offBase = offset + ZSTD_REP_NUM. */
+            seq->offBase = seqs[i].offset + ZSTD_REP_NUM;
+
+            /* Copy the literal run before this match. */
+            ZSTD_memcpy(zc->seqStore.lit, srcB + prevEnd, litLength);
+            zc->seqStore.lit += litLength;
+            prevEnd = pos + seqs[i].matchLength;
         }
+        /* Trailing literals. */
         {
-            size_t const lastLLSize = srcSize - pos;
-            ZSTD_storeLastLiterals_gpu(&zc->seqStore, srcB + pos, lastLLSize);
+            size_t const lastLLSize = srcSize - prevEnd;
+            ZSTD_storeLastLiterals_gpu(&zc->seqStore, srcB + prevEnd, lastLLSize);
         }
     }
 
