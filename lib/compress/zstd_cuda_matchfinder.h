@@ -140,6 +140,14 @@ struct ZSTD_GpuMatchFinder_s {
     cudaEvent_t evCompute[2];
     cudaEvent_t evD2H[2];
     cudaEvent_t evNbSeq[2];           /**< nbSeq D2H done (per buffer) */
+
+    /* G17 per-phase profiling (ZSTD_GPU_PROFILE=1). Nine phases:
+     * 0 H2D, 1 fillKeys, 2 radix, 3 recordSlot, 4 rowBounds, 5 search,
+     * 6 insert, 7 greedy, 8 D2H. Times accumulate in ms. */
+    int         profile;
+    double      phaseMs[9];
+    unsigned    phaseCount;
+    cudaEvent_t profEv[18];
 #else
     void* d_window;
     void* d_windowTmp;
