@@ -187,10 +187,12 @@ __global__ void gpuRadixScanL2(const unsigned* __restrict__ d_groupTotal,
     }
     __syncthreads();
     {
+        /* Prefix over the per-group totals for this digit : group g starts at
+         * the sum of the digit's counts in all earlier groups. */
         unsigned running = 0;
         for (unsigned g = 0; g < nGroups; g++) {
             d_groupPrefix[g * 256 + d] = running;
-            running += d_digitTotal[d];
+            running += d_groupTotal[g * 256 + d];
         }
     }
 }
