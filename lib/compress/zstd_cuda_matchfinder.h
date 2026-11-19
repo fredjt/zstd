@@ -127,6 +127,7 @@ struct ZSTD_GpuMatchFinder_s {
     unsigned*      d_cand;            /**< per-position candidates [B][128K] x (off,len) */
     unsigned*      d_seq;             /**< final sequences [B][MAX_SEQS] x 12 B */
     unsigned*      d_nbSeq;           /**< per-block sequence count [B] */
+    unsigned*      d_nbCand;          /**< per-block candidate count [B] (0 => no match) */
     unsigned*      d_blockMeta;       /**< per-block (absStart, size) [B][2] */
 
     unsigned*      h_cand[2];         /**< pinned mirror of d_cand (double-buffered) */
@@ -157,6 +158,7 @@ struct ZSTD_GpuMatchFinder_s {
     void* d_rowStart;
     void* d_rowEnd;
     void* d_cand;
+    void* d_nbCand;
     void* d_blockHist;
     void* d_digitStart;
     void* h_cand[2];

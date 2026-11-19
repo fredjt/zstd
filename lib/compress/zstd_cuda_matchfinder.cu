@@ -291,7 +291,8 @@ __global__ void gpuSearch(const unsigned char* __restrict__ d_window, unsigned w
                           unsigned hashLog, unsigned mls, unsigned posBits,
                           unsigned windowSize, unsigned minMatch,
                           unsigned totalPos,
-                          unsigned* __restrict__ d_cand)
+                          unsigned* __restrict__ d_cand,
+                          unsigned* __restrict__ d_nbCand)
 {
     unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= totalPos) return;
@@ -343,6 +344,7 @@ __global__ void gpuSearch(const unsigned char* __restrict__ d_window, unsigned w
     unsigned* const c = d_cand + (i * ZSTD_GPU_BLOCKSIZE + pib) * 2;
     c[0] = a - qc;                    /* offset */
     c[1] = ZSTD_GPU_MATCH_CAP;        /* capped length (the greedy extends it) */
+    atomicAdd(&d_nbCand[i], 1);       /* candidate count (0 => the greedy is a no-op) */
 }
 
 /* Insert: update the persistent table with the batch's positions (the latest
@@ -367,9 +369,16 @@ __global__ void gpuInsert(const unsigned char* __restrict__ d_window, unsigned w
 /* Device greedy : one thread per block scans its candidates and extends the
  * matches using the window (so cross-block matches are extended correctly).
  * ======================================================================== */
+/* Greedy resolution (one thread per block): walk the positions in order,
+ * emitting non-overlapping matches. The walk jumps past each emitted match
+ * (pib = pib + len) instead of stepping through the covered positions, so the
+ * number of d_cand loads is O(number of matches + unmatched prefix), not O(block
+ * size). Matches are extended in 8-byte chunks. Blocks with no candidates
+ * (incompressible data) return immediately. */
 __global__ void gpuGreedy(const unsigned char* __restrict__ d_window, unsigned winBase,
                           const unsigned* __restrict__ d_blockMeta, unsigned B,
                           const unsigned* __restrict__ d_cand,
+                          const unsigned* __restrict__ d_nbCand,
                           ZSTD_GpuSequence* __restrict__ d_seq,
                           unsigned* __restrict__ d_nbSeq)
 {
@@ -378,26 +387,27 @@ __global__ void gpuGreedy(const unsigned char* __restrict__ d_window, unsigned w
     if (threadIdx.x != 0) return;   /* one thread per block */
     unsigned const size = d_blockMeta[i*2+1];
     unsigned const absStart = d_blockMeta[i*2];
-    unsigned currentEnd = 0;
+    if (d_nbCand[i] == 0) { d_nbSeq[i] = 0; return; }
     unsigned nbSeq = 0;
-    for (unsigned pib = 0; pib + 1 < size; pib++) {
+    unsigned pib = 0;
+    while (pib + 1 < size) {
         unsigned const off = d_cand[(i * ZSTD_GPU_BLOCKSIZE + pib) * 2];
-        if (off == 0) continue;
-        if (pib < currentEnd) continue;
+        if (off == 0) { pib++; continue; }
         unsigned const a = absStart + pib;
         unsigned const qc = a - off;   /* match source (within the window) */
-        unsigned len = ZSTD_GPU_MATCH_CAP;
         unsigned char* const base = (unsigned char*)(d_window + (a - winBase));
-        unsigned char* cp = base + len;
-        unsigned char* cq = (unsigned char*)(d_window + (qc - winBase)) + len;
         unsigned char* const cend = base + (size - pib);
+        unsigned char* cp = base + ZSTD_GPU_MATCH_CAP;
+        unsigned char* cq = (unsigned char*)(d_window + (qc - winBase)) + ZSTD_GPU_MATCH_CAP;
+        unsigned len = ZSTD_GPU_MATCH_CAP;
+        while (cp + 8 <= cend && gpuRead64(cp) == gpuRead64(cq)) { cp += 8; cq += 8; len += 8; }
         while (cp < cend && *cp == *cq) { cp++; cq++; len++; }
         ZSTD_GpuSequence* const s = d_seq + (i * ZSTD_GPU_MAX_SEQS + nbSeq);
         s->position = pib;
         s->offset = off;
         s->matchLength = len;
         nbSeq++;
-        currentEnd = pib + len;
+        pib += len;   /* jump past the emitted match */
     }
     d_nbSeq[i] = nbSeq;
 }
@@ -451,12 +461,25 @@ size_t ZSTD_createGpuMatchFinder(
     if (!gpuMF || !cParams) return ERROR(GPU_invalidParameter);
     *gpuMF = NULL;
     if (!ZSTD_cudaAvailable()) return ERROR(GPU_cudaNotAvailable);
-    if (g_gpuRefCount >= 1) return ERROR(GPU_allocationFailed);  /* POC: one per process */
+    /* POC: at most one GPU match finder per process. The claim must be atomic:
+     * in multithreaded compression several worker contexts are initialized
+     * concurrently, and a plain check-then-set lets more than one of them
+     * through, creating several match finders whose independent windows and
+     * streams produce corrupted frames. */
+    {
+        int expected = 0;
+        if (!__atomic_compare_exchange_n(&g_gpuRefCount, &expected, 1, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return ERROR(GPU_allocationFailed);
+    }
 
     ZSTD_GpuMatchFinder* mf = NULL;
     {
         mf = (ZSTD_GpuMatchFinder*)calloc(1, sizeof(*mf));
-        if (!mf) return ERROR(GPU_allocationFailed);
+        if (!mf) {
+            __atomic_fetch_sub(&g_gpuRefCount, 1, __ATOMIC_SEQ_CST);  /* release the claim */
+            return ERROR(GPU_allocationFailed);
+        }
 
         mf->params = *cParams;
         mf->hashLog = cParams->hashLog;
@@ -512,6 +535,7 @@ size_t ZSTD_createGpuMatchFinder(
             if (cudaMalloc(&mf->d_digitStart, 256 * 4) != cudaSuccess) goto fail;
         }
         if (cudaMalloc(&mf->d_cand, (size_t)mf->B * ZSTD_GPU_BLOCKSIZE * 8) != cudaSuccess) goto fail;
+        if (cudaMalloc(&mf->d_nbCand, (size_t)mf->B * 4) != cudaSuccess) goto fail;
         if (cudaMalloc(&mf->d_seq, (size_t)mf->B * ZSTD_GPU_MAX_SEQS * 12) != cudaSuccess) goto fail;
         if (cudaMalloc(&mf->d_nbSeq, (size_t)mf->B * 4) != cudaSuccess) goto fail;
         if (cudaMalloc(&mf->d_blockMeta, (size_t)mf->B * 8) != cudaSuccess) goto fail;
@@ -563,8 +587,7 @@ size_t ZSTD_createGpuMatchFinder(
         mf->batchSeqsCopied[0] = mf->batchSeqsCopied[1] = 0;
         mf->batchIdx = 0;
 
-        g_gpuRefCount = 1;
-        *gpuMF = mf;
+        *gpuMF = mf;   /* g_gpuRefCount was claimed atomically above */
         return 0;
     }
 fail:
@@ -610,6 +633,7 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
     if (gpuMF->d_digitTotal) cudaFree(gpuMF->d_digitTotal);
     if (gpuMF->d_digitStart) cudaFree(gpuMF->d_digitStart);
     if (gpuMF->d_cand) cudaFree(gpuMF->d_cand);
+    if (gpuMF->d_nbCand) cudaFree(gpuMF->d_nbCand);
     if (gpuMF->d_seq) cudaFree(gpuMF->d_seq);
     if (gpuMF->d_nbSeq) cudaFree(gpuMF->d_nbSeq);
     if (gpuMF->d_blockMeta) cudaFree(gpuMF->d_blockMeta);
@@ -634,7 +658,7 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
         if (gpuMF->profEv[2*p+1]) cudaEventDestroy(gpuMF->profEv[2*p+1]);
     }
     free(gpuMF);
-    if (g_gpuRefCount > 0) g_gpuRefCount--;
+    if (g_gpuRefCount > 0) __atomic_fetch_sub(&g_gpuRefCount, 1, __ATOMIC_SEQ_CST);
     return 0;
 }
 
@@ -676,6 +700,7 @@ int ZSTD_gpuBatch_addBlock(ZSTD_GpuMatchFinder* gpuMF, void const* src, size_t s
         gpuMF->batchSize[inBatch] = (unsigned)srcSize;
         gpuMF->batchStagingOffset[inBatch + 1] = off + srcSize;
         gpuMF->batchCount++;
+        if (getenv("ZSTD_GPU_DEBUG_SEQS")) fprintf(stderr, "  add: inBatch=%u count=%u size=%zu buf=%u\n", inBatch, gpuMF->batchCount, srcSize, gpuMF->batchBuf);
         return (int)inBatch;
     }
 }
@@ -708,6 +733,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
     {
         unsigned const buf = gpuMF->batchBuf;
         unsigned const count = gpuMF->batchCount;
+        if (getenv("ZSTD_GPU_DEBUG_SEQS")) fprintf(stderr, "  submit: count=%u buf=%u batchIdx=%u\n", count, buf, gpuMF->batchIdx);
         if (count == 0) return 0;
         size_t const totalBytes = gpuMF->batchStagingOffset[count];
 
@@ -748,6 +774,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
         }
 
         /* H2D: append the batch bytes to the device window. */
+        gpuProfRec(gpuMF, 0, gpuMF->copyStream);   /* H2D phase start */
         if (cudaMemcpyAsync((unsigned char*)gpuMF->d_window + gpuMF->winUsed,
                             gpuMF->h_staging[buf], totalBytes,
                             cudaMemcpyHostToDevice, gpuMF->copyStream) != cudaSuccess)
@@ -755,9 +782,8 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
         gpuMF->winUsed += totalBytes;
         if (cudaEventRecord(gpuMF->evH2d[buf], gpuMF->copyStream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
-        gpuProfRec(gpuMF, 1, gpuMF->copyStream);
+        gpuProfRec(gpuMF, 1, gpuMF->copyStream);   /* H2D phase end */
 
-        gpuProfRec(gpuMF, 0, gpuMF->copyStream);
         /* Compute: wait for the H2D, then run the pipeline. */
         if (cudaStreamWaitEvent(gpuMF->stream, gpuMF->evH2d[buf], 0) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
@@ -843,6 +869,8 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
              * previous batch must not leak through as a phantom match. */
             if (cudaMemsetAsync(gpuMF->d_cand, 0, (size_t)count * ZSTD_GPU_BLOCKSIZE * 8, gpuMF->stream) != cudaSuccess)
                 return ERROR(GPU_cudaMemcpyFailed);
+            if (cudaMemsetAsync(gpuMF->d_nbCand, 0, (size_t)count * 4, gpuMF->stream) != cudaSuccess)
+                return ERROR(GPU_cudaMemcpyFailed);
 
             gpuProfRec(gpuMF, 10, gpuMF->stream);
             gpuSearch<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
@@ -852,7 +880,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 (unsigned*)gpuMF->d_table,
                 gpuMF->hashLog, gpuMF->mls, gpuMF->posBits,
                 gpuMF->windowSize, gpuMF->minMatch, totalPos,
-                (unsigned*)gpuMF->d_cand);
+                (unsigned*)gpuMF->d_cand, (unsigned*)gpuMF->d_nbCand);
             gpuProfRec(gpuMF, 11, gpuMF->stream);
 
             gpuInsert<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
@@ -866,6 +894,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
                 (unsigned*)gpuMF->d_blockMeta, count,
                 (unsigned*)gpuMF->d_cand,
+                (unsigned*)gpuMF->d_nbCand,
                 (ZSTD_GpuSequence*)gpuMF->d_seq,
                 (unsigned*)gpuMF->d_nbSeq);
             gpuProfRec(gpuMF, 15, gpuMF->stream);
@@ -885,7 +914,6 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
         if (cudaEventRecord(gpuMF->evNbSeq[buf], gpuMF->copyStream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
         gpuProfRec(gpuMF, 17, gpuMF->copyStream);
-        gpuProfAccum(gpuMF);
 
         /* Record the batch info for waitBlock. */
         gpuMF->batchInfo[buf].buf = buf;
@@ -943,11 +971,22 @@ size_t ZSTD_gpuBatch_waitBlock(ZSTD_GpuMatchFinder* gpuMF, unsigned batchIdx,
         if (cudaEventSynchronize(gpuMF->evD2H[slot]) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
 
+        /* G17: accumulate the per-phase times now that all of this batch's
+         * GPU work is complete (the events were recorded during submit). Done
+         * once per batch, on its last block, before the next submit overwrites
+         * the events. */
+        if (blockInBatch + 1 >= info->count) gpuProfAccum(gpuMF);
+
         {
             unsigned const nb = gpuMF->h_nbSeq[slot][blockInBatch];
             if (nb > dstCapacity) return ERROR(GPU_allocationFailed);
             ZSTD_GpuSequence const* const s = gpuMF->h_seq[slot] + (size_t)blockInBatch * ZSTD_GPU_MAX_SEQS;
             for (unsigned i = 0; i < nb; i++) dst[i] = s[i];
+            if (getenv("ZSTD_GPU_DEBUG_SEQS")) {
+                static unsigned dbgBlk = 0;
+                fprintf(stderr, "blk %u (batch %u inb %u) nb=%u\n", dbgBlk++, batchIdx, blockInBatch, nb);
+                for (unsigned i = 0; i < nb; i++) fprintf(stderr, "  pos=%u off=%u len=%u\n", s[i].position, s[i].offset, s[i].matchLength);
+            }
             return nb;
         }
     }
@@ -970,13 +1009,11 @@ size_t ZSTD_compressBlock_gpu(
     {
         int const inBatch = ZSTD_gpuBatch_addBlock(gpuMF, src, srcSize);
         if (inBatch < 0) return ERROR(GPU_allocationFailed);
-        {
-            size_t const err = ZSTD_gpuBatch_submit(gpuMF);
-            if (ZSTD_isError(err)) return err;
-            /* The block is inBatch of the just-submitted batch (batchIdx-1). */
-            unsigned const batchIdx = gpuMF->batchIdx - 1;
-            return ZSTD_gpuBatch_waitBlock(gpuMF, batchIdx, (unsigned)inBatch,
-                                           (ZSTD_GpuSequence*)dst, dstCapacity, src, srcSize);
-        }
+        size_t const err = ZSTD_gpuBatch_submit(gpuMF);
+        if (ZSTD_isError(err)) return err;
+        /* The block is inBatch of the just-submitted batch (batchIdx-1). */
+        unsigned const batchIdx = gpuMF->batchIdx - 1;
+        return ZSTD_gpuBatch_waitBlock(gpuMF, batchIdx, (unsigned)inBatch,
+                                       (ZSTD_GpuSequence*)dst, dstCapacity, src, srcSize);
     }
 }
