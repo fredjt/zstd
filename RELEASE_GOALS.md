@@ -423,7 +423,37 @@ release (2026-11-19):
 - **G17 (profiling + numbers) :** `ZSTD_GPU_PROFILE` per-phase timing is
   fixed (events were read before completion) and the refreshed numbers are in
   `doc/perf_results.md`.
+- **G18 (speed bottlenecks) :** the two G6 bottlenecks are attacked:
+  - *G18.1 (greedy) :* the single-thread match extension (the ~90 % periodic
+    cost) is now a warp-cooperative first-mismatch scan (32 lanes x 8 B per
+    round). rep greedy 1.91 -> 0.124 ms (15x).
+  - *G18.4 (search) :* the per-candidate global atomic is reduced per CUDA
+    block (shared counter + one global atomic). rep search 0.080 -> 0.009 ms
+    (9x).
+  - *G18.2/G18.5 :* dead `rowBounds`/`d_blockCounter` work removed; the
+    profiler now measures all 8 phases (recordSlot/insert were hidden).
+  1 GB level 1, RTX 3070: rep 20.3 s -> 3.2 s (52 -> 336 MiB/s, 6.5x); rnd
+  2.58 s -> 2.16 s (400 -> 497 MiB/s). Output byte-identical to the baseline
+  on both datasets; G5 suite passes.
 
-Remaining for the release: close the G14 1 GB ratio gap (larger GPU block
-size) and the G6 speed clause (GPU >= CPU) - the on-device greedy extension
-of long matches and the per-block launch/sync overhead are the gaps to close.
+Remaining for the release: the G6 speed clause (GPU >= CPU) is **not met** -
+see the analysis below. The G14 1 GB ratio gap (larger GPU block size) is the
+other open item.
+
+**G6 speed analysis (why the GPU cannot reach CPU on this architecture).**
+The per-128 KB-block GPU compute is algorithmically more expensive than the
+CPU's hash-table match finding: the GPU pays a 2-pass radix sort of all
+~131 K positions (0.070 ms) plus the search/greedy, whereas the CPU does an
+O(1) table lookup per position with no sort. Measured per-block GPU time is
+0.252 ms (rep) / 0.123 ms (rnd) vs a CPU total of ~0.018 ms (rep) / ~0.07 ms
+(rnd) - so the GPU compute alone is already 7-14x the CPU's whole block, and
+no host-side optimization can close that (the GPU compute is the floor).
+On top of that, the host submits one 128 KB block per GPU round-trip (the
+G10/G11 batch/pipeline infrastructure exists but `ZSTD_compressBlock_gpu`
+serializes it), so the fixed per-block overhead (~10 launches + 2 syncs +
+H2D/D2H) is paid 8192x per GB with zero overlap between the GPU and the host
+encoder. Two follow-ups would narrow the gap further but not close it:
+  - host-side batching/pipelining (stage B blocks per round-trip, overlap the
+    GPU with the host encode): ~1.3-1.5x, amortizes the fixed overhead;
+  - a sort-free device search (per-hash in-batch predecessor without the
+    radix sort): the only path to making the per-block GPU time competitive.

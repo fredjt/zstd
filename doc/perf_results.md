@@ -123,3 +123,44 @@ are in. `ZSTD_GPU_PROFILE=1` gives the per-phase table below.
   (periodic) and the per-block launch/sync overhead (random) are the gaps to
   close.
 
+---
+
+## Refreshed numbers (post G18)
+
+G18 attacked the two G6 bottlenecks: the single-thread greedy extension
+(G18.1, now a warp-cooperative first-mismatch scan) and the per-candidate
+global atomic in the search (G18.4, now a per-CUDA-block reduction). G18.2/
+G18.5 removed the dead `rowBounds`/`d_blockCounter` work and made the
+profiler measure all 8 phases. Same build, `-T1`, level 1, RTX 3070.
+
+### Phase breakdown (per 128 KB block, ms, level 1)
+
+| dataset | size  | H2D    | fillKeys | radix  | recordSlot | search | insert | greedy | D2H    | total  |
+| ------- | ----- | ------ | -------- | ------ | ---------- | ------ | ------ | ------ | ------ | ------ |
+| rnd     | 1 GB  | 0.019  | 0.006    | 0.071  | 0.010      | 0.015  | 0.007  | 0.003  | 0.005  | 0.135  |
+| rep     | 1 GB  | 0.019  | 0.005    | 0.070  | 0.010      | 0.009  | 0.010  | 0.124  | 0.005  | 0.252  |
+
+- **Periodic data :** the `greedy` is now 0.124 ms (was 1.911, 15x) - the
+  warp-cooperative extension of the one whole-block match. `radix` (0.070) is
+  now the second-largest phase.
+- **Random data :** `radix` (0.071, the 2-pass fingerprint sort) dominates;
+  the greedy is a no-op. ~0.135 ms/block.
+
+### End-to-end MiB/s (level 1, `-T1`)
+
+| MB    | rnd : gpu (G17) | rnd : gpu (G18) | rep : gpu (G17) | rep : gpu (G18) |
+| ----- | --------------- | --------------- | --------------- | --------------- |
+| 1024  | 255             | 492             | 52              | 364             |
+
+### Status vs acceptance (post G18)
+
+- **G6 speed clause (GPU >= CPU) :** still not met. rep 364 MiB/s vs CPU
+  ~1014; rnd 492 MiB/s vs CPU ~648. The per-block GPU compute (0.252 ms rep /
+  0.135 ms rnd) is algorithmically above the CPU's hash-table cost (no sort),
+  so it is the floor; the host also submits one block per GPU round-trip (no
+  overlap). See the G6 analysis in `RELEASE_GOALS.md`. Follow-ups: host-side
+  batching/pipelining (~1.3-1.5x) and a sort-free device search (the only path
+  to a competitive per-block GPU time).
+- **Correctness :** output byte-identical to the G17 baseline on both 1 GB
+  datasets; G5 suite passes.
+
