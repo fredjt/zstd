@@ -421,9 +421,13 @@ release (2026-11-19):
   on 1 GB (per-block overhead paid 8192x). Not yet within the ~5 % 1 GB
   target - the remaining gap is the per-block literal/table overhead, to be
   closed by driving the GPU with the CCtx's larger block size.
-- **G15 (greedy strategy) :** levels 3-4 now run the device path (verified
-  active) with ratio parity. Speed is still below CPU (greedy-extension
-  bottleneck).
+- **G15 (greedy strategy) :** levels 3-4 run the device path with ratio
+  parity. Note: in this tree levels 3-4 map to the `dfast` strategy (a new
+  strategy between `fast` and `greedy`), not `greedy` - the GPU conditions
+  had to cover `ZSTD_dfast` as well (previously levels 3-4 silently ran the
+  CPU match finder). Verified on both GPUs: 1 GB rep L3 GPU 97838 B vs CPU
+  98237 B (5070 Ti); 2 MB rep L3 GPU 236 B on both machines. Speed is still
+  below CPU (greedy-extension bottleneck).
 - **G16 (MT) :** `--multi --gpu` now produces valid frames (the match finder
   is reset on every context re-init / job) and matches the CPU ratio within
   0.3 %.
