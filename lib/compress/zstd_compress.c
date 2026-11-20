@@ -4652,9 +4652,61 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
     if (cctx->appliedParams.fParams.checksumFlag && srcSize)
         XXH64_update(&cctx->xxhState, src, srcSize);
 
+    /* G19 : host-side chunk pipeline. The GPU match finder stages a look-ahead
+     * of blocks (up to 2*B) so the GPU batch pipeline runs ahead of the host
+     * encoder (the GPU works on batch k+1 while the host encodes batch k). It
+     * requires fixed 128 KB blocks (the GPU window/batch layout is built for
+     * ZSTD_GPU_BLOCKSIZE) and no block splitting, so it only engages when those
+     * hold. For the one-shot API the frame chunk is the whole input, so the
+     * look-ahead has the source for 2 full batches. It only engages when the
+     * user requested the GPU match finder (ZSTD_c_gpuMatchFinder): a plain
+     * compression on a CUDA-enabled build must stay on the CPU path. */
+#ifdef ZSTD_CUDA
+    int gpuChunk = cctx->appliedParams.gpuMatchFinder
+        && (cctx->appliedParams.cParams.strategy == ZSTD_fast
+         || cctx->appliedParams.cParams.strategy == ZSTD_greedy)
+        && blockSizeMax == ZSTD_BLOCKSIZE_MAX
+        && !ZSTD_useTargetCBlockSize(&cctx->appliedParams)
+        && !ZSTD_blockSplitterEnabled(&cctx->appliedParams);
+    if (gpuChunk) {
+        /* Create the GPU match finder if not already done, so ZSTD_gpuChunk_begin
+         * has a valid context (it is normally created lazily on the first block).
+         * If creation fails (no device, GPU already owned by another context),
+         * fall back to the CPU match finder. */
+        if (!cctx->gpuMF) {
+            size_t const err = ZSTD_initGpuMatchFinderForCtx(cctx);
+            if (ZSTD_isError(err)) {
+                static int gpuWarned = 0;
+                if (!gpuWarned) {
+                    fprintf(stderr, "zstd: GPU match finder initialization failed; using the CPU match finder.\n");
+                    gpuWarned = 1;
+                }
+                gpuChunk = 0;
+            }
+        }
+        if (gpuChunk) {
+            const char* const syncEnv = getenv("ZSTD_GPU_SYNC");
+            int const forceSync = (syncEnv != NULL) && syncEnv[0] != '0' && syncEnv[0];
+            ((ZSTD_GpuMatchFinder*)cctx->gpuMF)->chunkMode = forceSync ? 0 : 1;
+            if (!forceSync) {
+                FORWARD_IF_ERROR(ZSTD_gpuChunk_begin((ZSTD_GpuMatchFinder*)cctx->gpuMF, src, srcSize),
+                                 "GPU chunk begin failed");
+            }
+        }
+    } else if (cctx->gpuMF) {
+        ((ZSTD_GpuMatchFinder*)cctx->gpuMF)->chunkMode = 0;
+    }
+#else
+    int const gpuChunk = 0;
+#endif
+
     while (remaining) {
         ZSTD_MatchState_t* const ms = &cctx->blockState.matchState;
-        size_t const blockSize = ZSTD_optimalBlockSize(cctx,
+#ifdef ZSTD_CUDA
+        size_t const blockSize = gpuChunk ?
+            MIN(remaining, ZSTD_BLOCKSIZE_MAX) :
+#endif
+            ZSTD_optimalBlockSize(cctx,
                                 ip, remaining,
                                 blockSizeMax,
                                 cctx->appliedParams.preBlockSplitter_level,

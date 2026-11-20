@@ -548,10 +548,12 @@ size_t ZSTD_createGpuMatchFinder(
         mf->nBlocksMax = mf->B * (ZSTD_GPU_BLOCKSIZE / ZSTD_GPU_THREADS);
 
         /* ---- Device buffers ---- */
-        /* The window buffer must hold the window (windowSize) plus a full batch
-         * (B blocks) so the H2D append never overflows. */
+        /* The window buffer must hold the window (windowSize) plus the bytes of
+         * the batches the GPU may still be computing. The chunk pipeline keeps
+         * at most 2 batches in flight (the double-buffered staging limit), so
+         * the headroom is 2 full batches (G19). */
         {
-            size_t const wbuf = (size_t)mf->windowSize + (size_t)mf->B * ZSTD_GPU_BLOCKSIZE;
+            size_t const wbuf = (size_t)mf->windowSize + (size_t)2 * mf->B * ZSTD_GPU_BLOCKSIZE;
             if (cudaMalloc(&mf->d_window, wbuf) != cudaSuccess) goto fail;
             if (cudaMalloc(&mf->d_windowTmp, wbuf) != cudaSuccess) goto fail;
         }
@@ -575,8 +577,10 @@ size_t ZSTD_createGpuMatchFinder(
         }
         if (cudaMalloc(&mf->d_cand, (size_t)mf->B * ZSTD_GPU_BLOCKSIZE * 8) != cudaSuccess) goto fail;
         if (cudaMalloc(&mf->d_nbCand, (size_t)mf->B * 4) != cudaSuccess) goto fail;
-        if (cudaMalloc(&mf->d_seq, (size_t)mf->B * ZSTD_GPU_MAX_SEQS * 12) != cudaSuccess) goto fail;
-        if (cudaMalloc(&mf->d_nbSeq, (size_t)mf->B * 4) != cudaSuccess) goto fail;
+        for (int b = 0; b < 2; b++) {
+            if (cudaMalloc(&mf->d_seq[b], (size_t)mf->B * ZSTD_GPU_MAX_SEQS * 12) != cudaSuccess) goto fail;
+            if (cudaMalloc(&mf->d_nbSeq[b], (size_t)mf->B * 4) != cudaSuccess) goto fail;
+        }
         if (cudaMalloc(&mf->d_blockMeta, (size_t)mf->B * 8) != cudaSuccess) goto fail;
 
         /* ---- Host pinned buffers (double-buffered) ---- */
@@ -670,8 +674,10 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
     if (gpuMF->d_digitStart) cudaFree(gpuMF->d_digitStart);
     if (gpuMF->d_cand) cudaFree(gpuMF->d_cand);
     if (gpuMF->d_nbCand) cudaFree(gpuMF->d_nbCand);
-    if (gpuMF->d_seq) cudaFree(gpuMF->d_seq);
-    if (gpuMF->d_nbSeq) cudaFree(gpuMF->d_nbSeq);
+    for (int b = 0; b < 2; b++) {
+        if (gpuMF->d_seq[b]) cudaFree(gpuMF->d_seq[b]);
+        if (gpuMF->d_nbSeq[b]) cudaFree(gpuMF->d_nbSeq[b]);
+    }
     if (gpuMF->d_blockMeta) cudaFree(gpuMF->d_blockMeta);
     if (gpuMF->h_cand[0]) cudaFreeHost(gpuMF->h_cand[0]);
     if (gpuMF->h_cand[1]) cudaFreeHost(gpuMF->h_cand[1]);
@@ -742,6 +748,19 @@ size_t ZSTD_gpuMatchFinder_reset(ZSTD_GpuMatchFinder* gpuMF)
     gpuMF->batchStagingOffset[0] = 0;
     gpuMF->batchSeqsCopied[0] = gpuMF->batchSeqsCopied[1] = 0;
     gpuMF->batchIdx = 0;
+    /* G19 chunk pipeline state (the global block index restarts at 0). */
+    gpuMF->chunkSrc = NULL;
+    gpuMF->chunkSize = 0;
+    gpuMF->chunkStartBlock = 0;
+    gpuMF->chunkEndBlock = 0;
+    gpuMF->nextWait = 0;
+    gpuMF->curBatchStart = 0;
+    gpuMF->histIdx = 0;
+    gpuMF->histBatchIdx[0] = gpuMF->histBatchIdx[1] = 0;
+    gpuMF->histStart[0] = gpuMF->histStart[1] = 0;
+    gpuMF->histCount[0] = gpuMF->histCount[1] = 0;
+    gpuMF->inFlight = 0;
+    gpuMF->chunkMode = 0;
     return 0;
 }
 
@@ -798,26 +817,33 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
 
         /* Build the per-block metadata (absolute start, size) on the host and
          * copy it to the device. */
-        static unsigned blockMetaHost[ZSTD_GPU_MAX_BATCH * 2];
+        /* Double-buffered per batch parity : the H2D is asynchronous, so the
+         * host must not overwrite a buffer whose copy is still in flight (the
+         * chunk pipeline submits the next batch before this one is consumed).
+         * With at most 2 batches in flight, parity is safe. */
+        static unsigned blockMetaHost[2][ZSTD_GPU_MAX_BATCH * 2];
         {
             unsigned abs = gpuMF->framePos;
             for (unsigned i = 0; i < count; i++) {
-                blockMetaHost[i*2] = abs;
-                blockMetaHost[i*2+1] = gpuMF->batchSize[i];
+                blockMetaHost[buf][i*2] = abs;
+                blockMetaHost[buf][i*2+1] = gpuMF->batchSize[i];
                 abs += gpuMF->batchSize[i];
             }
         }
-        if (cudaMemcpyAsync(gpuMF->d_blockMeta, blockMetaHost, count * 8,
+        if (cudaMemcpyAsync(gpuMF->d_blockMeta, blockMetaHost[buf], count * 8,
                             cudaMemcpyHostToDevice, gpuMF->copyStream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
 
         /* Window management: if appending this batch would overflow the window
-         * buffer (windowSize + one block), slide the window forward first. The
-         * slide is an overlapping device copy, so it goes through a temp buffer
-         * (cudaMemcpyAsync is undefined for overlapping src/dst). */
+         * buffer (windowSize + the in-flight batch bytes, 2 batches with the
+         * chunk pipeline), slide the window forward first. The slide discards
+         * only history older than the window (the in-flight bytes are always
+         * the newest ones). The slide is an overlapping device copy, so it
+         * goes through a temp buffer (cudaMemcpyAsync is undefined for
+         * overlapping src/dst). */
         {
             size_t const needed = gpuMF->winUsed + totalBytes;
-            size_t const cap = (size_t)gpuMF->windowSize + (size_t)gpuMF->B * ZSTD_GPU_BLOCKSIZE;
+            size_t const cap = (size_t)gpuMF->windowSize + (size_t)2 * gpuMF->B * ZSTD_GPU_BLOCKSIZE;
             if (needed > cap) {
                 size_t const shift = needed - cap;
                 if (cudaMemcpyAsync(gpuMF->d_windowTmp, gpuMF->d_window, gpuMF->winUsed,
@@ -939,8 +965,8 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 (unsigned*)gpuMF->d_blockMeta, count,
                 (unsigned*)gpuMF->d_cand,
                 (unsigned*)gpuMF->d_nbCand,
-                (ZSTD_GpuSequence*)gpuMF->d_seq,
-                (unsigned*)gpuMF->d_nbSeq);
+                (ZSTD_GpuSequence*)gpuMF->d_seq[buf],
+                (unsigned*)gpuMF->d_nbSeq[buf]);
             gpuProfRec(gpuMF, 13, gpuMF->stream);
         }
         if (cudaEventRecord(gpuMF->evCompute[buf], gpuMF->stream) != cudaSuccess)
@@ -951,7 +977,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
         if (cudaStreamWaitEvent(gpuMF->copyStream, gpuMF->evCompute[buf], 0) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
         gpuProfRec(gpuMF, 14, gpuMF->copyStream);
-        if (cudaMemcpyAsync(gpuMF->h_nbSeq[buf], gpuMF->d_nbSeq,
+        if (cudaMemcpyAsync(gpuMF->h_nbSeq[buf], gpuMF->d_nbSeq[buf],
                             (size_t)count * 4,
                             cudaMemcpyDeviceToHost, gpuMF->copyStream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
@@ -1003,7 +1029,7 @@ size_t ZSTD_gpuBatch_waitBlock(ZSTD_GpuMatchFinder* gpuMF, unsigned batchIdx,
                 if (nb > ZSTD_GPU_MAX_SEQS) return ERROR(GPU_allocationFailed);
                 if (nb == 0) continue;
                 if (cudaMemcpyAsync(gpuMF->h_seq[slot] + (size_t)i * ZSTD_GPU_MAX_SEQS,
-                                    (ZSTD_GpuSequence*)gpuMF->d_seq + (size_t)i * ZSTD_GPU_MAX_SEQS,
+                                    (ZSTD_GpuSequence*)gpuMF->d_seq[slot] + (size_t)i * ZSTD_GPU_MAX_SEQS,
                                     (size_t)nb * sizeof(ZSTD_GpuSequence),
                                     cudaMemcpyDeviceToHost, gpuMF->copyStream) != cudaSuccess)
                     return ERROR(GPU_cudaMemcpyFailed);
@@ -1032,6 +1058,114 @@ size_t ZSTD_gpuBatch_waitBlock(ZSTD_GpuMatchFinder* gpuMF, unsigned batchIdx,
                 for (unsigned i = 0; i < nb; i++) fprintf(stderr, "  pos=%u off=%u len=%u\n", s[i].position, s[i].offset, s[i].matchLength);
             }
             return nb;
+        }
+    }
+}
+
+/* ======================================================================== */
+/* Host-side chunk pipeline (G19)                                           */
+/* ======================================================================== */
+
+/* Submit the current (unsubmitted) batch and record it in the 2-slot
+ * submitted-batch history (used by ZSTD_gpuChunk_processBlock to map a global
+ * block index to its (batchIdx, in-batch index)). The double-buffering allows
+ * at most 2 batches in flight, so a 2-slot history is sufficient (the batch
+ * being waited on is always one of the last 2 submitted). */
+static size_t gpuChunk_submitBatch(ZSTD_GpuMatchFinder* gpuMF)
+{
+    unsigned const start = gpuMF->curBatchStart;
+    unsigned const count = gpuMF->batchCount;
+    if (count == 0) return 0;
+    size_t const err = ZSTD_gpuBatch_submit(gpuMF);
+    if (ZSTD_isError(err)) return err;
+    gpuMF->histBatchIdx[gpuMF->histIdx] = gpuMF->batchIdx - 1;  /* submit() incremented batchIdx */
+    gpuMF->histStart[gpuMF->histIdx] = start;
+    gpuMF->histCount[gpuMF->histIdx] = count;
+    gpuMF->histIdx ^= 1;
+    gpuMF->curBatchStart = start + count;
+    gpuMF->inFlight++;
+    return 0;
+}
+
+/* Begin a frame chunk for the chunk pipeline. The global block index of the
+ * chunk's first block is the next block to stage (curBatchStart + batchCount),
+ * which equals the previous chunk's end (the look-ahead is limited to the
+ * current chunk, so it never stages past the chunk end). */
+size_t ZSTD_gpuChunk_begin(ZSTD_GpuMatchFinder* gpuMF, void const* src, size_t srcSize)
+{
+    if (!gpuMF || !src) return ERROR(GPU_invalidParameter);
+    gpuMF->chunkSrc = src;
+    gpuMF->chunkSize = srcSize;
+    gpuMF->chunkStartBlock = gpuMF->curBatchStart + gpuMF->batchCount;
+    gpuMF->chunkEndBlock = gpuMF->chunkStartBlock
+                         + (unsigned)((srcSize + ZSTD_GPU_BLOCKSIZE - 1) / ZSTD_GPU_BLOCKSIZE);
+    return 0;
+}
+
+/* Stage the look-ahead: blocks from (curBatchStart + batchCount) up to
+ * min(globalBlockIdx + 2*B, chunkEndBlock), submitting each batch as it fills.
+ * The staging buffer is double-buffered (one unsubmitted batch per buffer),
+ * and the host may only write batch k+2's buffer once batch k's H2D has
+ * completed - which holds iff at most 2 batches are in flight. So a full batch
+ * is submitted only while inFlight < 2; otherwise staging pauses until the
+ * host encoder consumes another block (which frees a pipeline slot). The GPU
+ * still works on batch k+1 while the host waits for / encodes batch k. */
+static size_t gpuChunk_stageLookahead(ZSTD_GpuMatchFinder* gpuMF, unsigned globalBlockIdx)
+{
+    unsigned const upTo = (globalBlockIdx + 2 * gpuMF->B < gpuMF->chunkEndBlock)
+                        ? (globalBlockIdx + 2 * gpuMF->B)
+                        : gpuMF->chunkEndBlock;
+    while (gpuMF->curBatchStart + gpuMF->batchCount < upTo) {
+        if (gpuMF->batchCount >= gpuMF->B) {
+            if (gpuMF->inFlight >= 2) break;   /* pipeline full; resume on the next block */
+            FORWARD_IF_ERROR(gpuChunk_submitBatch(gpuMF), "GPU chunk batch submit failed");
+        }
+        {
+            unsigned const b = gpuMF->curBatchStart + gpuMF->batchCount;
+            size_t const off = (size_t)(b - gpuMF->chunkStartBlock) * ZSTD_GPU_BLOCKSIZE;
+            size_t const sz = (gpuMF->chunkSize - off < ZSTD_GPU_BLOCKSIZE)
+                            ? (gpuMF->chunkSize - off)
+                            : (size_t)ZSTD_GPU_BLOCKSIZE;
+            int const inBatch = ZSTD_gpuBatch_addBlock(gpuMF, (const char*)gpuMF->chunkSrc + off, sz);
+            if (inBatch < 0) return ERROR(GPU_allocationFailed);
+        }
+    }
+    return 0;
+}
+
+/* Stage the look-ahead and wait for the next block's sequences (in order).
+ * The current block is gpuMF->nextWait (advanced per call). */
+size_t ZSTD_gpuChunk_processBlock(ZSTD_GpuMatchFinder* gpuMF, ZSTD_GpuSequence* dst,
+                                  size_t dstCapacity)
+{
+    if (!gpuMF || !dst) return ERROR(GPU_invalidParameter);
+    {
+        unsigned const g = gpuMF->nextWait;
+        FORWARD_IF_ERROR(gpuChunk_stageLookahead(gpuMF, g), "GPU chunk stage failed");
+        /* If the current block is still in the unsubmitted batch (the look-ahead
+         * was limited by the chunk end), submit it (partial) so the GPU has it. */
+        if (g >= gpuMF->curBatchStart) {
+            FORWARD_IF_ERROR(gpuChunk_submitBatch(gpuMF), "GPU chunk batch submit failed");
+        }
+        /* Map the global block index to (batchIdx, in-batch index) via the
+         * 2-slot submitted-batch history. */
+        {
+            unsigned batchIdx = 0, blockInBatch = 0, slot = 0;
+            int found = 0;
+            for (int i = 0; i < 2; i++) {
+                if (g >= gpuMF->histStart[i] && g < gpuMF->histStart[i] + gpuMF->histCount[i]) {
+                    batchIdx = gpuMF->histBatchIdx[i];
+                    blockInBatch = g - gpuMF->histStart[i];
+                    slot = (unsigned)i;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) return ERROR(GPU_invalidParameter);
+            /* Waiting on the batch's last block frees a pipeline slot. */
+            if (blockInBatch + 1 == gpuMF->histCount[slot]) gpuMF->inFlight--;
+            gpuMF->nextWait++;
+            return ZSTD_gpuBatch_waitBlock(gpuMF, batchIdx, blockInBatch, dst, dstCapacity, NULL, 0);
         }
     }
 }

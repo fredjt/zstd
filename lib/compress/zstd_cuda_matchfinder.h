@@ -107,6 +107,24 @@ struct ZSTD_GpuMatchFinder_s {
     unsigned batchIdx;               /**< number of batches submitted so far */
     ZSTD_GpuBatchInfo batchInfo[2];
 
+    /* Host-side chunk pipeline (G19): the host stages a look-ahead of up to
+     * 2*B blocks per frame chunk so the GPU batch pipeline runs ahead of the
+     * host encoder (the GPU processes batch k+1 while the host encodes batch k).
+     * Block indices below are global (within the frame). The next block to
+     * stage is curBatchStart + batchCount (derived, not stored). */
+    const void* chunkSrc;            /**< base of the current frame chunk */
+    size_t      chunkSize;           /**< size of the current frame chunk */
+    unsigned    chunkStartBlock;     /**< global index of the chunk's first block */
+    unsigned    chunkEndBlock;       /**< global index one past the chunk's last block */
+    unsigned    nextWait;            /**< global index of the next block to wait for */
+    unsigned    curBatchStart;       /**< global index of the first block in the current (unsubmitted) batch */
+    unsigned    histIdx;             /**< rotating index (0/1) for the submitted-batch history */
+    unsigned    histBatchIdx[2];     /**< batchIdx of the last 2 submitted batches */
+    unsigned    histStart[2];        /**< global index of the first block in the last 2 submitted batches */
+    unsigned    histCount[2];        /**< number of blocks in the last 2 submitted batches */
+    unsigned    inFlight;            /**< submitted batches not yet fully consumed (<= 2: the double-buffered pipeline) */
+    int         chunkMode;           /**< 1 if the frame chunk loop drives the chunk pipeline */
+
     /* CUDA resources */
 #ifdef ZSTD_CUDA
     unsigned char* d_window;          /**< device sliding window (windowSize + 128 KB) */
@@ -125,8 +143,8 @@ struct ZSTD_GpuMatchFinder_s {
     unsigned*      d_digitTotal;      /**< radix digit totals [256] */
     unsigned*      d_digitStart;      /**< radix digit global starts [256] */
     unsigned*      d_cand;            /**< per-position candidates [B][128K] x (off,len) */
-    unsigned*      d_seq;             /**< final sequences [B][MAX_SEQS] x 12 B */
-    unsigned*      d_nbSeq;           /**< per-block sequence count [B] */
+    unsigned*      d_seq[2];          /**< final sequences [B][MAX_SEQS] x 12 B (double-buffered per batch parity: the next batch's greedy must not overwrite a batch whose D2H is still in flight) */
+    unsigned*      d_nbSeq[2];        /**< per-block sequence count [B] (double-buffered, same reason) */
     unsigned*      d_nbCand;          /**< per-block candidate count [B] (0 => no match) */
     unsigned*      d_blockMeta;       /**< per-block (absStart, size) [B][2] */
 
@@ -245,6 +263,24 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF);
 size_t ZSTD_gpuBatch_waitBlock(ZSTD_GpuMatchFinder* gpuMF, unsigned batchIdx,
                                unsigned blockInBatch, ZSTD_GpuSequence* dst,
                                size_t dstCapacity, void const* src, size_t srcSize);
+
+/* ---- Chunk pipeline (G19) ---- */
+
+/**
+ * Begin a frame chunk for the chunk pipeline. Sets the chunk source so the
+ * host can stage a look-ahead of blocks (up to 2*B) ahead of the block being
+ * waited for. Must be called once per frame chunk, before any
+ * ZSTD_gpuChunk_processBlock call. The global block index continues across
+ * chunks within a frame (reset by ZSTD_gpuMatchFinder_reset).
+ */
+size_t ZSTD_gpuChunk_begin(ZSTD_GpuMatchFinder* gpuMF, void const* src, size_t srcSize);
+
+/**
+ * Stage the look-ahead and wait for the next block's sequences (in order).
+ * Returns the number of sequences written to dst, or an error code.
+ */
+size_t ZSTD_gpuChunk_processBlock(ZSTD_GpuMatchFinder* gpuMF, ZSTD_GpuSequence* dst,
+                                  size_t dstCapacity);
 
 /**
  * Perform GPU-accelerated match finding for a single block (synchronous).

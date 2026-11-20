@@ -100,9 +100,6 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
     size_t i;
 
     if (!zc || !src) return ERROR(GPU_invalidParameter);
-    if (srcSize < 4)
-        /* Block too small for compression */
-        return ZSTDbss_noCompress;
 
     /* Initialize GPU match finder if not already done */
     if (!gpuMF)
@@ -123,8 +120,27 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
      * so the rep arrays are left at zero. */
     rep[0] = rep[1] = rep[2] = 0;
 
-    /* Run GPU match finding - delegates to .cu implementation */
-    const size_t nbSeq = ZSTD_compressBlock_gpu(gpuMF, (ZSTD_Sequence*)seqs, maxNbSeq, src, srcSize, rep, rep);
+    /* Run GPU match finding - delegates to .cu implementation. The chunk
+     * pipeline (G19) is driven by the frame chunk loop, which stages a
+     * look-ahead of blocks so the GPU runs ahead of the host encoder; it
+     * advances nextWait per block and must therefore be called for every
+     * block (even tiny ones). Otherwise fall back to the synchronous
+     * single-block path. */
+    size_t nbSeq;
+    if (gpuMF->chunkMode)
+    {
+        nbSeq = ZSTD_gpuChunk_processBlock(gpuMF, (ZSTD_GpuSequence*)seqs, maxNbSeq);
+    }
+    else
+    {
+        if (srcSize < 4)
+        {
+            /* Block too small for compression */
+            free(seqs);
+            return ZSTDbss_noCompress;
+        }
+        nbSeq = ZSTD_compressBlock_gpu(gpuMF, (ZSTD_Sequence*)seqs, maxNbSeq, src, srcSize, rep, rep);
+    }
     if (ZSTD_isError(nbSeq))
     {
         free(seqs);
