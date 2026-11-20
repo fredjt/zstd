@@ -295,57 +295,79 @@ __global__ void gpuSearch(const unsigned char* __restrict__ d_window, unsigned w
                           unsigned* __restrict__ d_cand,
                           unsigned* __restrict__ d_nbCand)
 {
+    /* G18.4 : the candidate count is reduced per CUDA block (a shared counter
+     * plus one global atomic per block) instead of one global atomic per
+     * candidate position. On periodic data every position is a candidate, so
+     * the per-position version serialized ~131K global atomics on one address
+     * per 128 KB block. No early returns : every thread reaches the final
+     * __syncthreads. */
+    __shared__ unsigned s_count[ZSTD_GPU_MAX_BATCH];
+    if (threadIdx.x < B) s_count[threadIdx.x] = 0;
+    __syncthreads();
     unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= totalPos) return;
-    unsigned i, a, pib;
-    gpuBatchLocate(d_blockMeta, B, t, i, a, pib);
-    unsigned char const* const p = d_window + (a - winBase);
-    unsigned const h = gpuHash(p, hashLog, mls);
+    int isCand = 0;
+    unsigned i = 0;
+    if (t < totalPos) {
+        unsigned a, pib;
+        gpuBatchLocate(d_blockMeta, B, t, i, a, pib);
+        unsigned char const* const p = d_window + (a - winBase);
+        unsigned const h = gpuHash(p, hashLog, mls);
 
-    /* In-batch predecessor: the element just before t in the sorted array, if
-     * it has the same hash. Position 0 is a valid absolute position, so track
-     * validity separately. */
-    unsigned q1 = 0; int hasQ1 = 0;
-    {
-        unsigned const j = d_slot[t];
-        if (j > 0) {
-            unsigned long long const prev = d_keysSorted[j-1];
-            if ((unsigned)(prev >> posBits) == h) {
-                unsigned const tPrev = (unsigned)(prev & ((1ull << posBits) - 1));
-                unsigned iPrev, aPrev, pibPrev;
-                gpuBatchLocate(d_blockMeta, B, tPrev, iPrev, aPrev, pibPrev);
-                q1 = aPrev; hasQ1 = 1;
+        /* In-batch predecessor: the element just before t in the sorted array,
+         * if it has the same hash. Position 0 is a valid absolute position, so
+         * track validity separately. */
+        unsigned q1 = 0; int hasQ1 = 0;
+        {
+            unsigned const j = d_slot[t];
+            if (j > 0) {
+                unsigned long long const prev = d_keysSorted[j-1];
+                if ((unsigned)(prev >> posBits) == h) {
+                    unsigned const tPrev = (unsigned)(prev & ((1ull << posBits) - 1));
+                    unsigned iPrev, aPrev, pibPrev;
+                    gpuBatchLocate(d_blockMeta, B, tPrev, iPrev, aPrev, pibPrev);
+                    q1 = aPrev; hasQ1 = 1;
+                }
             }
         }
+        /* Pre-batch table entry (latest same-hash position before the batch),
+         * stored as pos+1 with 0 meaning empty. */
+        unsigned q2 = 0; int hasQ2 = 0;
+        if (d_table[h] != 0) { q2 = d_table[h] - 1; hasQ2 = 1; }
+
+        /* Candidate = the max of the valid entries (both are < a). */
+        unsigned qc = 0; int hasQ = 0;
+        if (hasQ1) { qc = q1; hasQ = 1; }
+        if (hasQ2 && (!hasQ1 || q2 > qc)) { qc = q2; hasQ = 1; }
+
+        int pass = hasQ;
+        if (pass) {
+            /* Window-age check (G12.2): skip candidates older than the window
+             * before touching the data. */
+            pass = (a - qc <= windowSize);
+        }
+        if (pass) {
+            unsigned char const* const qp = d_window + (qc - winBase);
+            /* 8-byte prefilter (G12.1): two 64-bit loads at the candidate head.
+             * Valid positions always have 8 bytes left in the block (nValid =
+             * size-7), so the read stays inside the block. For the GPU levels
+             * minMatch <= 8, so a passing prefilter means the candidate is at
+             * least minMatch long; the capped length is ZSTD_GPU_MATCH_CAP and
+             * the greedy extends it. */
+            (void)minMatch;
+            pass = (gpuRead64(p) == gpuRead64(qp));
+        }
+        if (pass) {
+            unsigned* const c = d_cand + (i * ZSTD_GPU_BLOCKSIZE + pib) * 2;
+            c[0] = a - qc;                    /* offset */
+            c[1] = ZSTD_GPU_MATCH_CAP;        /* capped length (the greedy extends it) */
+            isCand = 1;
+        }
     }
-    /* Pre-batch table entry (latest same-hash position before the batch),
-     * stored as pos+1 with 0 meaning empty. */
-    unsigned q2 = 0; int hasQ2 = 0;
-    if (d_table[h] != 0) { q2 = d_table[h] - 1; hasQ2 = 1; }
-
-    /* Candidate = the max of the valid entries (both are < a). */
-    unsigned qc = 0; int hasQ = 0;
-    if (hasQ1) { qc = q1; hasQ = 1; }
-    if (hasQ2 && (!hasQ1 || q2 > qc)) { qc = q2; hasQ = 1; }
-    if (!hasQ) return;
-
-    /* Window-age check (G12.2): skip candidates older than the window before
-     * touching the data. */
-    if (a - qc > windowSize) return;
-
-    unsigned char const* const qp = d_window + (qc - winBase);
-    /* 8-byte prefilter (G12.1): two 64-bit loads at the candidate head. Valid
-     * positions always have 8 bytes left in the block (nValid = size-7), so the
-     * read stays inside the block. For the GPU levels minMatch <= 8, so a
-     * passing prefilter means the candidate is at least minMatch long; the
-     * capped length is ZSTD_GPU_MATCH_CAP and the greedy extends it. */
-    (void)minMatch;
-    if (gpuRead64(p) != gpuRead64(qp)) return;
-
-    unsigned* const c = d_cand + (i * ZSTD_GPU_BLOCKSIZE + pib) * 2;
-    c[0] = a - qc;                    /* offset */
-    c[1] = ZSTD_GPU_MATCH_CAP;        /* capped length (the greedy extends it) */
-    atomicAdd(&d_nbCand[i], 1);       /* candidate count (0 => the greedy is a no-op) */
+    if (isCand) atomicAdd(&s_count[i], 1);   /* per-CUDA-block reduction */
+    __syncthreads();
+    for (unsigned k = threadIdx.x; k < B; k += blockDim.x) {
+        if (s_count[k]) atomicAdd(&d_nbCand[k], s_count[k]);   /* one global atomic per block */
+    }
 }
 
 /* Insert: update the persistent table with the batch's positions (the latest
