@@ -23,7 +23,7 @@
  *  - Blocks are processed in batches of B. Per batch:
  *      copy stream : [window memmove] + H2D append of the batch bytes
  *      compute     : wait -> fillKeys -> nPasses x radix -> recordSlot ->
- *                    rowBounds -> search (candidate = max(in-batch row
+ *                    search (candidate = max(in-batch row
  *                    predecessor, pre-batch table entry)) -> insert
  *                    (atomicMax table update for the next batch)
  *      copy stream : wait -> D2H of the per-position candidates
@@ -210,7 +210,6 @@ __global__ void gpuRadixScatter(const unsigned long long* __restrict__ d_keys,
                                 const unsigned* __restrict__ d_digitStart,
                                 const unsigned* __restrict__ d_groupPrefix,
                                 const unsigned* __restrict__ d_blockStartLocal,
-                                unsigned* __restrict__ d_blockCounter,
                                 unsigned long long* __restrict__ d_keysB)
 {
     __shared__ unsigned s_digit[256];
@@ -244,38 +243,6 @@ __global__ void gpuRecordSlot(const unsigned long long* __restrict__ d_keysSorte
     if (j >= totalPos) return;
     unsigned const t = (unsigned)(d_keysSorted[j] & ((1ull << posBits) - 1));
     d_slot[t] = j;
-}
-
-/* Row bounds per hash over the whole batch: the sorted array is ordered by
- * (hash, position), so each hash's row is contiguous. Each row's start/end is
- * written by exactly one thread (the boundary element). Empty rows are
- * pre-initialized to [totalPos, totalPos). */
-__global__ void gpuRowBoundsInit(unsigned* __restrict__ d_rowStart,
-                                 unsigned* __restrict__ d_rowEnd,
-                                 unsigned hashLog, unsigned totalPos)
-{
-    unsigned const h = blockIdx.x * blockDim.x + threadIdx.x;
-    if (h < (1u << hashLog)) { d_rowStart[h] = totalPos; d_rowEnd[h] = totalPos; }
-}
-
-__global__ void gpuRowBounds(const unsigned long long* __restrict__ d_keysSorted,
-                             unsigned posBits, unsigned totalPos,
-                             unsigned* __restrict__ d_rowStart,
-                             unsigned* __restrict__ d_rowEnd)
-{
-    unsigned const j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= totalPos) return;
-    unsigned const h = (unsigned)(d_keysSorted[j] >> posBits);
-    if (j == 0) {
-        d_rowStart[h] = j;
-    } else {
-        unsigned const hPrev = (unsigned)(d_keysSorted[j-1] >> posBits);
-        if (hPrev != h) {
-            d_rowEnd[hPrev] = j;
-            d_rowStart[h] = j;
-        }
-    }
-    if (j == totalPos - 1) d_rowEnd[h] = j + 1;
 }
 
 /* The search: for each valid position, the candidate is the max of the
@@ -519,8 +486,7 @@ size_t ZSTD_estimateGpuMatchFinderMemory(
         bytes += (size_t)(1u << hashLog) * 4;                              /* table */
         bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8 * 2;                   /* keyA/keyB */
         bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 4;                       /* slot */
-        bytes += (size_t)(1u << hashLog) * 4 * 2;                          /* rowStart/End */
-        bytes += (size_t)B * 512 * 256 * 4 * 3;                            /* hist/startLocal/counter */
+        bytes += (size_t)B * 512 * 256 * 4 * 2;                            /* hist/startLocal */
         bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8;                       /* cand */
         bytes += (size_t)B * ZSTD_GPU_MAX_SEQS * 12;                       /* seq */
         bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8 * 2;                   /* pinned cand (x2) */
@@ -597,13 +563,10 @@ size_t ZSTD_createGpuMatchFinder(
             if (cudaMalloc(&mf->d_keyB, kbytes) != cudaSuccess) goto fail;
         }
         if (cudaMalloc(&mf->d_slot, (size_t)mf->B * ZSTD_GPU_BLOCKSIZE * 4) != cudaSuccess) goto fail;
-        if (cudaMalloc(&mf->d_rowStart, (size_t)(1u << mf->hashLog) * 4) != cudaSuccess) goto fail;
-        if (cudaMalloc(&mf->d_rowEnd, (size_t)(1u << mf->hashLog) * 4) != cudaSuccess) goto fail;
         {
             size_t const hbytes = (size_t)mf->nBlocksMax * 256 * 4;
             if (cudaMalloc(&mf->d_blockHist, hbytes) != cudaSuccess) goto fail;
             if (cudaMalloc(&mf->d_blockStartLocal, hbytes) != cudaSuccess) goto fail;
-            if (cudaMalloc(&mf->d_blockCounter, hbytes) != cudaSuccess) goto fail;
             size_t const gbytes = (size_t)((mf->nBlocksMax + 255) / 256) * 256 * 4;
             if (cudaMalloc(&mf->d_groupTotal, gbytes) != cudaSuccess) goto fail;
             if (cudaMalloc(&mf->d_groupPrefix, gbytes) != cudaSuccess) goto fail;
@@ -646,7 +609,7 @@ size_t ZSTD_createGpuMatchFinder(
             const char* const pe = getenv("ZSTD_GPU_PROFILE");
             if (pe && pe[0] && pe[0] != '0') {
                 mf->profile = 1;
-                for (int p = 0; p < 9; p++) {
+                for (int p = 0; p < 8; p++) {
                     if (cudaEventCreate(&mf->profEv[2*p]) != cudaSuccess) goto fail;
                     if (cudaEventCreate(&mf->profEv[2*p+1]) != cudaSuccess) goto fail;
                 }
@@ -675,13 +638,13 @@ fail:
 static void gpuProfReport(const ZSTD_GpuMatchFinder* mf)
 {
     if (!mf->profile || mf->phaseCount == 0) return;
-    static const char* const names[9] = {
-        "H2D", "fillKeys", "radix", "recordSlot", "rowBounds",
+    static const char* const names[8] = {
+        "H2D", "fillKeys", "radix", "recordSlot",
         "search", "insert", "greedy", "D2H"};
     double total = 0;
-    for (int p = 0; p < 9; p++) total += mf->phaseMs[p];
+    for (int p = 0; p < 8; p++) total += mf->phaseMs[p];
     fprintf(stderr, "[ZSTD_GPU_PROFILE] per 128KB block (avg over %u batches)\n", (unsigned)mf->phaseCount);
-    for (int p = 0; p < 9; p++) {
+    for (int p = 0; p < 8; p++) {
         double avg = mf->phaseMs[p] / (double)mf->phaseCount;
         double pct = (total > 0) ? 100.0 * avg / (total / (double)mf->phaseCount) : 0.0;
         fprintf(stderr, "  %-11s %9.4f ms  %5.1f%%\n", names[p], avg, pct);
@@ -699,11 +662,8 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
     if (gpuMF->d_keyA) cudaFree(gpuMF->d_keyA);
     if (gpuMF->d_keyB) cudaFree(gpuMF->d_keyB);
     if (gpuMF->d_slot) cudaFree(gpuMF->d_slot);
-    if (gpuMF->d_rowStart) cudaFree(gpuMF->d_rowStart);
-    if (gpuMF->d_rowEnd) cudaFree(gpuMF->d_rowEnd);
     if (gpuMF->d_blockHist) cudaFree(gpuMF->d_blockHist);
     if (gpuMF->d_blockStartLocal) cudaFree(gpuMF->d_blockStartLocal);
-    if (gpuMF->d_blockCounter) cudaFree(gpuMF->d_blockCounter);
     if (gpuMF->d_groupTotal) cudaFree(gpuMF->d_groupTotal);
     if (gpuMF->d_groupPrefix) cudaFree(gpuMF->d_groupPrefix);
     if (gpuMF->d_digitTotal) cudaFree(gpuMF->d_digitTotal);
@@ -729,7 +689,7 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
         if (gpuMF->evD2H[b]) cudaEventDestroy(gpuMF->evD2H[b]);
         if (gpuMF->evNbSeq[b]) cudaEventDestroy(gpuMF->evNbSeq[b]);
     }
-    if (gpuMF->profile) for (int p = 0; p < 9; p++) {
+    if (gpuMF->profile) for (int p = 0; p < 8; p++) {
         if (gpuMF->profEv[2*p]) cudaEventDestroy(gpuMF->profEv[2*p]);
         if (gpuMF->profEv[2*p+1]) cudaEventDestroy(gpuMF->profEv[2*p+1]);
     }
@@ -807,8 +767,7 @@ int ZSTD_gpuBatch_addBlock(ZSTD_GpuMatchFinder* gpuMF, void const* src, size_t s
 
 /* Submit the current batch to the GPU (asynchronous). Issues:
  *   copy stream  : [window memmove] + H2D append
- *   compute      : wait -> fillKeys -> radix -> slot -> rowBounds -> search
- *                  -> insert
+ *   compute      : wait -> fillKeys -> radix -> slot -> search -> insert
  *   copy stream  : wait -> D2H of the per-position candidates
  * The batch state is reset so the next batch can be staged. */
 /* G17 per-phase profiling helpers (no-ops unless ZSTD_GPU_PROFILE). */
@@ -819,7 +778,7 @@ static void gpuProfRec(ZSTD_GpuMatchFinder* mf, int idx, cudaStream_t st)
 static void gpuProfAccum(ZSTD_GpuMatchFinder* mf)
 {
     if (!mf->profile) return;
-    for (int p = 0; p < 9; p++) {
+    for (int p = 0; p < 8; p++) {
         float ms = 0.f;
         (void)cudaEventElapsedTime(&ms, mf->profEv[2*p], mf->profEv[2*p+1]);
         mf->phaseMs[p] += ms;
@@ -897,10 +856,6 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
             unsigned const nGroups = (nBlocks + 255) / 256;
             unsigned const grid = (totalPos + ZSTD_GPU_THREADS - 1) / ZSTD_GPU_THREADS;
 
-            /* Zero the scatter counters for the blocks we will use. */
-            if (cudaMemsetAsync(gpuMF->d_blockCounter, 0, (size_t)nBlocks * 256 * 4, gpuMF->stream) != cudaSuccess)
-                return ERROR(GPU_cudaMemcpyFailed);
-
             gpuProfRec(gpuMF, 2, gpuMF->stream);
             gpuFillKeys<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
@@ -926,13 +881,10 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                         (unsigned*)gpuMF->d_groupTotal, nGroups,
                         (unsigned*)gpuMF->d_digitTotal, (unsigned*)gpuMF->d_digitStart,
                         (unsigned*)gpuMF->d_groupPrefix);
-                    /* Re-zero the counters for this pass (the previous pass used them). */
-                    if (cudaMemsetAsync(gpuMF->d_blockCounter, 0, (size_t)nBlocks * 256 * 4, gpuMF->stream) != cudaSuccess)
-                        return ERROR(GPU_cudaMemcpyFailed);
                     gpuRadixScatter<<<nBlocks, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
                         cur, bitOffset, totalPos,
                         (unsigned*)gpuMF->d_digitStart, (unsigned*)gpuMF->d_groupPrefix,
-                        (unsigned*)gpuMF->d_blockStartLocal, (unsigned*)gpuMF->d_blockCounter,
+                        (unsigned*)gpuMF->d_blockStartLocal,
                         nxt);
                     /* Swap. */
                     { unsigned long long* tmp = cur; cur = nxt; nxt = tmp; }
@@ -947,21 +899,11 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
             }
 
             gpuProfRec(gpuMF, 5, gpuMF->stream);
+            gpuProfRec(gpuMF, 6, gpuMF->stream);   /* recordSlot start */
             gpuRecordSlot<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
                 (unsigned long long*)gpuMF->d_keyA, gpuMF->posBits, totalPos,
                 (unsigned*)gpuMF->d_slot);
             gpuProfRec(gpuMF, 7, gpuMF->stream);
-
-            {
-                unsigned const rgrid = ((1u << gpuMF->hashLog) + ZSTD_GPU_THREADS - 1) / ZSTD_GPU_THREADS;
-                gpuRowBoundsInit<<<rgrid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                    (unsigned*)gpuMF->d_rowStart, (unsigned*)gpuMF->d_rowEnd,
-                    gpuMF->hashLog, totalPos);
-                gpuProfRec(gpuMF, 8, gpuMF->stream);
-                gpuRowBounds<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                    (unsigned long long*)gpuMF->d_keyA, gpuMF->posBits, totalPos,
-                    (unsigned*)gpuMF->d_rowStart, (unsigned*)gpuMF->d_rowEnd);
-            }
 
             /* Clear the batch's candidate slots before the search. The search
              * only writes positions that yield a valid candidate, and the
@@ -972,7 +914,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
             if (cudaMemsetAsync(gpuMF->d_nbCand, 0, (size_t)count * 4, gpuMF->stream) != cudaSuccess)
                 return ERROR(GPU_cudaMemcpyFailed);
 
-            gpuProfRec(gpuMF, 10, gpuMF->stream);
+            gpuProfRec(gpuMF, 8, gpuMF->stream);
             gpuSearch<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
                 (unsigned*)gpuMF->d_blockMeta, count,
@@ -981,15 +923,17 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 gpuMF->hashLog, gpuMF->mls, gpuMF->posBits,
                 gpuMF->windowSize, gpuMF->minMatch, totalPos,
                 (unsigned*)gpuMF->d_cand, (unsigned*)gpuMF->d_nbCand);
-            gpuProfRec(gpuMF, 11, gpuMF->stream);
+            gpuProfRec(gpuMF, 9, gpuMF->stream);   /* search end */
 
+            gpuProfRec(gpuMF, 10, gpuMF->stream);   /* insert start */
             gpuInsert<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
                 (unsigned*)gpuMF->d_blockMeta, count,
                 gpuMF->hashLog, gpuMF->mls, totalPos,
                 (unsigned*)gpuMF->d_table);
+            gpuProfRec(gpuMF, 11, gpuMF->stream);   /* insert end */
 
-            gpuProfRec(gpuMF, 14, gpuMF->stream);
+            gpuProfRec(gpuMF, 12, gpuMF->stream);
             gpuGreedy<<<count, 32, 0, gpuMF->stream>>>(
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
                 (unsigned*)gpuMF->d_blockMeta, count,
@@ -997,7 +941,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 (unsigned*)gpuMF->d_nbCand,
                 (ZSTD_GpuSequence*)gpuMF->d_seq,
                 (unsigned*)gpuMF->d_nbSeq);
-            gpuProfRec(gpuMF, 15, gpuMF->stream);
+            gpuProfRec(gpuMF, 13, gpuMF->stream);
         }
         if (cudaEventRecord(gpuMF->evCompute[buf], gpuMF->stream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
@@ -1006,14 +950,14 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
          * is copied in waitBlock, once the host knows the counts. */
         if (cudaStreamWaitEvent(gpuMF->copyStream, gpuMF->evCompute[buf], 0) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
-        gpuProfRec(gpuMF, 16, gpuMF->copyStream);
+        gpuProfRec(gpuMF, 14, gpuMF->copyStream);
         if (cudaMemcpyAsync(gpuMF->h_nbSeq[buf], gpuMF->d_nbSeq,
                             (size_t)count * 4,
                             cudaMemcpyDeviceToHost, gpuMF->copyStream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
         if (cudaEventRecord(gpuMF->evNbSeq[buf], gpuMF->copyStream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);
-        gpuProfRec(gpuMF, 17, gpuMF->copyStream);
+        gpuProfRec(gpuMF, 15, gpuMF->copyStream);
 
         /* Record the batch info for waitBlock. */
         gpuMF->batchInfo[buf].buf = buf;
