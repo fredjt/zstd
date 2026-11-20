@@ -3302,7 +3302,9 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
      * requested strategy on the CPU otherwise. See the design note in
      * doc/gpu_matchfinding_design.md for the tradeoffs. ) */
 #ifdef ZSTD_CUDA
-    if (zc->gpuMF && ZSTD_cudaAvailable() && zc->appliedParams.cParams.strategy == ZSTD_fast) {
+    if (zc->gpuMF && ZSTD_cudaAvailable() &&
+        (zc->appliedParams.cParams.strategy == ZSTD_fast ||
+         zc->appliedParams.cParams.strategy == ZSTD_greedy)) {
         return ZSTD_buildSeqStore_gpu(zc, src, srcSize);
     }
 #endif
