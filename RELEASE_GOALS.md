@@ -454,6 +454,12 @@ release (2026-11-19):
   stays on the CPU path). Measured vs the synchronous path (RTX 3070, L1):
   16 MB 1.4-1.8x, 256 MB 2.5-3.0x (rnd 483 -> 1197, rep 378 -> 1141 MiB/s).
   G5 suite passes; 1 GB rnd/rep roundtrip byte-identical; ratio unchanged.
+  Verified on the RTX 5070 Ti (sm_120) as well: G5 passes, 1 GB roundtrip
+  byte-identical, ratio +2.3% (100110 B vs 97853 B), chunk 1.7-3.0x vs sync.
+  This exposed two build/robustness bugs, now fixed: the default arch lists
+  lacked sm_120 (kernels absent from the binary -> every launch failed
+  silently -> all-literals output), and kernel-launch failures were never
+  checked (now: one-time warning + CPU match-finder fallback).
 
 Remaining for the release: the G6 speed clause (GPU >= CPU) is **not met** -
 see the analysis below. The G14 1 GB ratio gap is **closed** (see G14

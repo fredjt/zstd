@@ -180,9 +180,19 @@ forces the old synchronous path). Level 1, one-shot, end-to-end MiB/s:
 with size: with 16 blocks per batch the GPU amortizes its ~10 kernel launches
 and the H2D latency of the next batch is hidden behind the current batch's
 compute. At 1 MB (8 blocks, half a batch) there is little to overlap, hence
-the small gain. The G6 speed clause (GPU >= CPU end-to-end) is still not met
-- the per-block GPU compute is the floor (see the G6 analysis in
-`RELEASE_GOALS.md`); the remaining follow-up is a sort-free device search.
+the small gain.
+
+Same comparison on the RTX 5070 Ti (sm_120, 32-core host), level 1:
+
+| MB    | rnd : sync | rnd : chunk | rep : sync | rep : chunk | rep : cpu |
+| ----- | ---------- | ----------- | ---------- | ----------- | --------- |
+| 16    | 644.3      | 1083.0      | 415.1      | 859.9       | 15920.4   |
+| 256   | 888.6      | 1859.6      | 510.6      | 1521.6      | 14723.8   |
+
+1.7-3.0x vs the synchronous path. The G6 speed clause (GPU >= CPU end-to-end)
+is not met on either machine - the per-block GPU compute is the floor (see
+the G6 analysis in `RELEASE_GOALS.md`); the remaining follow-up is a
+sort-free device search.
 
 Correctness: G5 suite passes; 1 GB rnd/rep roundtrip byte-identical; ratio
 unchanged (1 GB rep level 1: GPU 97934 B vs CPU 97853 B, +0.08%; level 3:
