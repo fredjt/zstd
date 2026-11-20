@@ -101,7 +101,7 @@ struct ZSTD_GpuMatchFinder_s {
     /* Batch state */
     unsigned batchCount;             /**< blocks staged in the current batch */
     unsigned batchBuf;               /**< current staging buffer (0/1) */
-    unsigned batchStagingOffset[2];  /**< per in-batch block, offset in staging */
+    unsigned batchStagingOffset[ZSTD_GPU_MAX_BATCH + 1];  /**< per in-batch block, offset in staging (index count = total bytes) */
     unsigned batchSize[ZSTD_GPU_MAX_BATCH];
     unsigned batchSeqsCopied[2];
     unsigned batchIdx;               /**< number of batches submitted so far */
