@@ -164,3 +164,27 @@ profiler measure all 8 phases. Same build, `-T1`, level 1, RTX 3070.
 - **Correctness :** output byte-identical to the G17 baseline on both 1 GB
   datasets; G5 suite passes.
 
+## G19 : host-side chunk pipeline (2026-11-20, RTX 3070)
+
+The frame chunk loop now stages a look-ahead of blocks so the GPU batch
+pipeline runs ahead of the host encoder (2 batches in flight; `ZSTD_GPU_SYNC=1`
+forces the old synchronous path). Level 1, one-shot, end-to-end MiB/s:
+
+| MB    | rnd : sync | rnd : chunk | rep : sync | rep : chunk |
+| ----- | ---------- | ----------- | ---------- | ----------- |
+| 1     | 43.8       | 45.3        | 45.8       | 47.2        |
+| 16    | 282.6      | 385.1       | 221.3      | 399.7       |
+| 256   | 483.5      | 1197.2      | 377.7      | 1140.8      |
+
+1.4-1.8x at 16 MB, 2.5-3.0x at 256 MB vs the synchronous path. The gain grows
+with size: with 16 blocks per batch the GPU amortizes its ~10 kernel launches
+and the H2D latency of the next batch is hidden behind the current batch's
+compute. At 1 MB (8 blocks, half a batch) there is little to overlap, hence
+the small gain. The G6 speed clause (GPU >= CPU end-to-end) is still not met
+- the per-block GPU compute is the floor (see the G6 analysis in
+`RELEASE_GOALS.md`); the remaining follow-up is a sort-free device search.
+
+Correctness: G5 suite passes; 1 GB rnd/rep roundtrip byte-identical; ratio
+unchanged (1 GB rep level 1: GPU 97934 B vs CPU 97853 B, +0.08%; level 3:
+byte-identical csize).
+

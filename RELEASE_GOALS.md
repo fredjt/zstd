@@ -353,6 +353,13 @@ Headline gaps the series must close:
 - **Accept:** on the 1 GB periodic file at level 1, GPU csize is within
   ~5% of CPU csize (baseline: 573 KB vs 98 KB); G5 suite passes with
   large-block inputs.
+- **Status (2026-11-20): met.** The 5.8x baseline penalty was closed by the
+  G12/G13 window-management work (the device window now tracks the CPU
+  context's 1 MB window across blocks, so cross-block matches are found);
+  the larger-GPU-block-size item was never needed. Measured, RTX 3070,
+  45-byte-periodic data: 1 MB level 1 GPU 106 B vs CPU 113 B (GPU smaller);
+  1 GB level 1 GPU 97934 B vs CPU 97853 B (+0.08%); 1 GB level 3
+  GPU 98237 B = CPU 98237 B (byte-identical csize).
 
 ### G15. Support the greedy strategy (levels 3–4) on the GPU
 1. Implement the greedy match search on the device (searchLog/chainLog
@@ -435,10 +442,22 @@ release (2026-11-19):
   1 GB level 1, RTX 3070: rep 20.3 s -> 3.2 s (52 -> 336 MiB/s, 6.5x); rnd
   2.58 s -> 2.16 s (400 -> 497 MiB/s). Output byte-identical to the baseline
   on both datasets; G5 suite passes.
+- **G19 (host-side chunk pipeline) :** the frame chunk loop now stages a
+  look-ahead of blocks so the GPU batch pipeline runs ahead of the host
+  encoder (2 batches in flight). This exposed three concurrency bugs in the
+  G10-G13 infrastructure, now fixed: the `batchStagingOffset` array was
+  sized [2] and overlapped `batchSize` (any multi-block batch clobbered the
+  per-block sizes - committed bug, single-block path never hit it); `d_seq`/
+  `d_nbSeq` and the host metadata buffer are double-buffered per batch
+  parity; the device window headroom grew to 2 full batches. The chunk
+  pipeline engages only with `--gpu` (a plain compression on a CUDA build
+  stays on the CPU path). Measured vs the synchronous path (RTX 3070, L1):
+  16 MB 1.4-1.8x, 256 MB 2.5-3.0x (rnd 483 -> 1197, rep 378 -> 1141 MiB/s).
+  G5 suite passes; 1 GB rnd/rep roundtrip byte-identical; ratio unchanged.
 
 Remaining for the release: the G6 speed clause (GPU >= CPU) is **not met** -
-see the analysis below. The G14 1 GB ratio gap (larger GPU block size) is the
-other open item.
+see the analysis below. The G14 1 GB ratio gap is **closed** (see G14
+status: +0.08% at 1 GB level 1, byte-identical csize at level 3).
 
 **G6 speed analysis (why the GPU cannot reach CPU on this architecture).**
 The per-128 KB-block GPU compute is algorithmically more expensive than the
@@ -452,8 +471,12 @@ On top of that, the host submits one 128 KB block per GPU round-trip (the
 G10/G11 batch/pipeline infrastructure exists but `ZSTD_compressBlock_gpu`
 serializes it), so the fixed per-block overhead (~10 launches + 2 syncs +
 H2D/D2H) is paid 8192x per GB with zero overlap between the GPU and the host
-encoder. Two follow-ups would narrow the gap further but not close it:
-  - host-side batching/pipelining (stage B blocks per round-trip, overlap the
-    GPU with the host encode): ~1.3-1.5x, amortizes the fixed overhead;
+encoder. Follow-ups:
+  - host-side batching/pipelining: **done (G19)** - measured 1.4-1.8x at
+    16 MB and 2.5-3.0x at 256 MB (RTX 3070, L1), more than the ~1.3-1.5x
+    estimate, because the look-ahead also hides the H2D latency of the next
+    batch behind the current batch's compute;
   - a sort-free device search (per-hash in-batch predecessor without the
-    radix sort): the only path to making the per-block GPU time competitive.
+    radix sort): the only remaining path to making the per-block GPU time
+    competitive (the radix sort is ~0.07 ms of the ~0.25 ms per-block GPU
+    time).
