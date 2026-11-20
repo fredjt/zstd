@@ -3312,6 +3312,7 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
 #ifdef ZSTD_CUDA
     if (zc->gpuMF && ZSTD_cudaAvailable() &&
         (zc->appliedParams.cParams.strategy == ZSTD_fast ||
+         zc->appliedParams.cParams.strategy == ZSTD_dfast ||
          zc->appliedParams.cParams.strategy == ZSTD_greedy)) {
         size_t const gpuNbSeq = ZSTD_buildSeqStore_gpu(zc, src, srcSize);
         if (!ZSTD_isError(gpuNbSeq)) return gpuNbSeq;
@@ -4688,6 +4689,7 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
 #ifdef ZSTD_CUDA
     int gpuChunk = cctx->appliedParams.gpuMatchFinder
         && (cctx->appliedParams.cParams.strategy == ZSTD_fast
+         || cctx->appliedParams.cParams.strategy == ZSTD_dfast
          || cctx->appliedParams.cParams.strategy == ZSTD_greedy)
         && blockSizeMax == ZSTD_BLOCKSIZE_MAX
         && !ZSTD_useTargetCBlockSize(&cctx->appliedParams)
