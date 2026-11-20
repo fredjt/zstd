@@ -114,8 +114,11 @@ are in. `ZSTD_GPU_PROFILE=1` gives the per-phase table below.
   now matches the CPU within ~4 % on 1 MB and is ~20 % larger on 1 GB (the
   per-block literal/table overhead paid 8192 times). Not yet within the ~5 %
   1 GB target.
-- **G15 greedy strategy :** levels 3-4 now run the device path (verified
-  active) with ratio parity (167 B = 167 B at levels 3-4 on 1 MB).
+- **G15 levels 3-4 :** levels 3-4 run the device path with ratio parity.
+  In this tree levels 3-4 map to the `dfast` strategy (not `greedy`), which
+  the GPU conditions had to cover as well; before that fix they silently
+  ran the CPU match finder. 1 GB rep L3 : GPU 97838 B vs CPU 98237 B
+  (5070 Ti); 2 MB rep L3 : GPU 236 B on both machines.
 - **G16 MT :** `--multi --gpu` produces valid frames and matches the CPU ratio
   within 0.3 % (100 MB rep : 9652 B vs 9623 B).
 - **G6 speed clause (GPU >= CPU for match finding) :** not yet met - the GPU is
