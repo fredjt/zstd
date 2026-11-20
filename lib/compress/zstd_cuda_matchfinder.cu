@@ -662,6 +662,30 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
     return 0;
 }
 
+/* Reset the match finder to its initial (empty) state, keeping the device
+ * buffers. Called when the owning context is re-initialized - in particular
+ * for every job in multithreaded compression, where the context's own window
+ * is reset per job. Without this the GPU window would accumulate the previous
+ * job's data (with a hole where the other workers' jobs were), the frame
+ * position would be wrong, and stale hash-table entries would produce invalid
+ * offsets - i.e. corrupted frames. */
+size_t ZSTD_resetGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
+{
+    if (!gpuMF) return 0;
+    if (cudaMemsetAsync(gpuMF->d_table, 0, (size_t)(1u << gpuMF->hashLog) * 4, gpuMF->stream) != cudaSuccess)
+        return ERROR(GPU_cudaMemcpyFailed);
+    gpuMF->winBase = 0;
+    gpuMF->winUsed = 0;
+    gpuMF->framePos = 0;
+    gpuMF->batchCount = 0;
+    gpuMF->batchBuf = 0;
+    gpuMF->batchStagingOffset[0] = 0;
+    gpuMF->batchIdx = 0;
+    gpuMF->batchInfo[0].seqsCopied = 0;
+    gpuMF->batchInfo[1].seqsCopied = 0;
+    return 0;
+}
+
 /* ======================================================================== */
 /* Host: batch pipeline                                                      */
 /* ======================================================================== */

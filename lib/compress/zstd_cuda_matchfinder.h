@@ -202,6 +202,7 @@ size_t ZSTD_createGpuMatchFinder(
  * @return 0 on success
  */
 size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF);
+size_t ZSTD_resetGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF);
 
 /**
  * Initialize the GPU match finder from CCtx parameters.

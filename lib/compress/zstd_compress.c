@@ -2300,17 +2300,26 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
          * stays on the CPU match finder and a one-time warning goes to
          * stderr. zc->gpuMF == NULL selects the CPU path per block. */
 #ifdef ZSTD_CUDA
-        if (params->gpuMatchFinder && !zc->gpuMF) {
-            static int gpuWarned = 0;
-            if (ZSTD_cudaAvailable()) {
-                size_t const gpuErr = ZSTD_initGpuMatchFinderForCtx(zc);
-                if (ZSTD_isError(gpuErr) && !gpuWarned) {
-                    fprintf(stderr, "zstd: GPU match finder initialization failed; using the CPU match finder.\n");
+        if (params->gpuMatchFinder) {
+            if (zc->gpuMF) {
+                /* Re-initialization (e.g. a new job in multithreaded mode):
+                 * the context's window is reset, so the GPU match finder's
+                 * window/table/frame position must be reset too, or stale
+                 * data and a wrong frame position corrupt the frame. */
+                FORWARD_IF_ERROR(ZSTD_resetGpuMatchFinder((ZSTD_GpuMatchFinder*) zc->gpuMF),
+                                 "GPU match finder reset failed");
+            } else {
+                static int gpuWarned = 0;
+                if (ZSTD_cudaAvailable()) {
+                    size_t const gpuErr = ZSTD_initGpuMatchFinderForCtx(zc);
+                    if (ZSTD_isError(gpuErr) && !gpuWarned) {
+                        fprintf(stderr, "zstd: GPU match finder initialization failed; using the CPU match finder.\n");
+                        gpuWarned = 1;
+                    }
+                } else if (!gpuWarned) {
+                    fprintf(stderr, "zstd: --gpu requested but no CUDA device is available; using the CPU match finder.\n");
                     gpuWarned = 1;
                 }
-            } else if (!gpuWarned) {
-                fprintf(stderr, "zstd: --gpu requested but no CUDA device is available; using the CPU match finder.\n");
-                gpuWarned = 1;
             }
         }
 #endif
