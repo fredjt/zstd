@@ -660,6 +660,10 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
 {
     if (!gpuMF) return 0;
     gpuProfReport(gpuMF);
+    /* Drain any in-flight work before freeing the buffers it touches
+     * (the runtime fallback path can free the MF mid-frame). */
+    if (gpuMF->stream) cudaStreamSynchronize(gpuMF->stream);
+    if (gpuMF->copyStream) cudaStreamSynchronize(gpuMF->copyStream);
     if (gpuMF->d_window) cudaFree(gpuMF->d_window);
     if (gpuMF->d_windowTmp) cudaFree(gpuMF->d_windowTmp);
     if (gpuMF->d_table) cudaFree(gpuMF->d_table);
@@ -968,6 +972,16 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 (ZSTD_GpuSequence*)gpuMF->d_seq[buf],
                 (unsigned*)gpuMF->d_nbSeq[buf]);
             gpuProfRec(gpuMF, 13, gpuMF->stream);
+        }
+        /* Catch kernel-launch failures (e.g. "no kernel image is available" when
+         * the binary was built without this GPU's architecture). Without this
+         * check the launches fail silently, every block comes back with zero
+         * sequences, and the output degrades to all-literals with no warning.
+         * The caller (ZSTD_buildSeqStore_gpu) turns the error into a one-time
+         * warning plus the CPU match finder. */
+        {
+            cudaError_t const e = cudaGetLastError();
+            if (e != cudaSuccess) return ERROR(GPU_kernelLaunchFailed);
         }
         if (cudaEventRecord(gpuMF->evCompute[buf], gpuMF->stream) != cudaSuccess)
             return ERROR(GPU_cudaMemcpyFailed);

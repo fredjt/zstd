@@ -239,8 +239,10 @@ ifneq ($(ZSTD_CUDA), 0)
       CPPFLAGS += -DZSTD_CUDA -I$(CUDA_HOME)/include
 
       # Target GPU architectures : default multi-gencode list, override with
-      # ZSTD_CUDA_ARCHS (comma separated, e.g. "80,86,90") or ZSTD_CUDA_ARCHS=native
-      ZSTD_CUDA_ARCHS ?= 80,86,90
+      # ZSTD_CUDA_ARCHS (comma separated, e.g. "80,86,90") or ZSTD_CUDA_ARCHS=native.
+      # 120 = consumer Blackwell (RTX 50 series); without it the kernels are
+      # absent from the binary and every launch fails on those GPUs.
+      ZSTD_CUDA_ARCHS ?= 80,86,90,120
       ZSTD_CUDA_COMMA := ,
       ifeq ($(ZSTD_CUDA_ARCHS),native)
         NVCC_ARCH_FLAGS := -arch=native

@@ -3287,6 +3287,14 @@ ZSTD_transferSequences_wBlockDelim(ZSTD_CCtx* cctx,
 
 typedef enum { ZSTDbss_compress, ZSTDbss_noCompress } ZSTD_BuildSeqStore_e;
 
+#ifdef ZSTD_CUDA
+/* Process-wide : once the GPU path has failed at runtime (e.g. the binary
+ * carries no kernel image for this GPU's architecture), do not try to
+ * recreate the match finder for every frame chunk. Set by the fallback in
+ * ZSTD_buildSeqStore, read by ZSTD_compress_frameChunk. */
+static int ZSTD_gpuRuntimeFailed = 0;
+#endif
+
 static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
 {
     ZSTD_MatchState_t* const ms = &zc->blockState.matchState;
@@ -3305,7 +3313,23 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
     if (zc->gpuMF && ZSTD_cudaAvailable() &&
         (zc->appliedParams.cParams.strategy == ZSTD_fast ||
          zc->appliedParams.cParams.strategy == ZSTD_greedy)) {
-        return ZSTD_buildSeqStore_gpu(zc, src, srcSize);
+        size_t const gpuNbSeq = ZSTD_buildSeqStore_gpu(zc, src, srcSize);
+        if (!ZSTD_isError(gpuNbSeq)) return gpuNbSeq;
+        /* The GPU path failed at runtime (e.g. the binary carries no kernel
+         * image for this GPU's architecture). Warn once, drop the GPU match
+         * finder, and fall back to the CPU match finder for this block and
+         * all following blocks : the frame must stay valid and compressed. */
+        {
+            static int gpuRuntimeWarned = 0;
+            if (!gpuRuntimeWarned) {
+                fprintf(stderr, "zstd: GPU match finding failed (%s); falling back to the CPU match finder.\n",
+                        ZSTD_getErrorName(gpuNbSeq));
+                gpuRuntimeWarned = 1;
+            }
+            ZSTD_freeGpuMatchFinder((ZSTD_GpuMatchFinder*)zc->gpuMF);
+            zc->gpuMF = NULL;
+            ZSTD_gpuRuntimeFailed = 1;
+        }
     }
 #endif
     /* Assert that we have correctly flushed the ctx params into the ms's copy */
@@ -4667,7 +4691,8 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
          || cctx->appliedParams.cParams.strategy == ZSTD_greedy)
         && blockSizeMax == ZSTD_BLOCKSIZE_MAX
         && !ZSTD_useTargetCBlockSize(&cctx->appliedParams)
-        && !ZSTD_blockSplitterEnabled(&cctx->appliedParams);
+        && !ZSTD_blockSplitterEnabled(&cctx->appliedParams)
+        && !ZSTD_gpuRuntimeFailed;
     if (gpuChunk) {
         /* Create the GPU match finder if not already done, so ZSTD_gpuChunk_begin
          * has a valid context (it is normally created lazily on the first block).
