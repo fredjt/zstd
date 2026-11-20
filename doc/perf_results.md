@@ -68,3 +68,58 @@ the same code path modulo the (tiny) per-block GPU-context overhead.
    - move the greedy scan onto the device (it only needs the candidates and
      the window).
 
+---
+
+## Refreshed numbers (post G10-G17)
+
+Measured with the CMake CUDA build, single-threaded `-T1`, level 1, on the
+same RTX 3070. The G10-G14 pipeline (double-buffered H2D, batched launches,
+8-byte prefilter, on-device greedy) and the G15 greedy-strategy enablement
+are in. `ZSTD_GPU_PROFILE=1` gives the per-phase table below.
+
+### Phase breakdown (per 128 KB block, ms, level 1)
+
+| dataset | size  | H2D    | fillKeys | radix  | search | greedy | D2H    | total  |
+| ------- | ----- | ------ | -------- | ------ | ------ | ------ | ------ | ------ |
+| rnd     | 1 MB  | 0.023  | 0.086    | 0.108  | 0.022  | 0.009  | 0.011  | 0.258  |
+| rep     | 1 MB  | 0.023  | 0.090    | 0.106  | 0.094  | 2.112  | 0.009  | 2.433  |
+| rnd     | 1 GB  | 0.022  | 0.011    | 0.089  | 0.016  | 0.004  | 0.010  | 0.153  |
+| rep     | 1 GB  | 0.022  | 0.012    | 0.082  | 0.079  | 1.911  | 0.007  | 2.114  |
+
+- **Random data :** `radix` (the 4-pass fingerprint sort) and `fillKeys`
+  dominate; the greedy is a no-op (no candidates). ~0.15 ms/block at 1 GB.
+- **Periodic data :** the on-device `greedy` dominates (~90 %) because a
+  single thread extends one very long match (the whole block) sequentially.
+  This is the main remaining speed gap.
+
+### End-to-end MiB/s (level 1, `-T1`)
+
+| MB    | rnd : cpu | rnd : gpu | rep : cpu | rep : gpu |
+| ----- | --------- | --------- | --------- | --------- |
+| 16    | 533       | 28        | 533       | 21        |
+| 1024  | 648       | 255       | 1014      | 52        |
+
+### Ratio (level 1, csize)
+
+| input    | cpu  | gpu  | note |
+| -------- | ---- | ---- | ---- |
+| 1 MB rep | 168  | 161  | gpu within ~4 % |
+| 1 GB rep | 97.9 KB | 117.6 KB | gpu ~20 % larger (per-block overhead paid 8192x) |
+
+### Status vs acceptance
+
+- **G5 correctness :** full suite passes, including 10 MB / 100 MB inputs in
+  default (multi-threaded) mode, after the G16 per-job reset.
+- **G14 ratio :** the 5.8x baseline penalty (573 KB vs 98 KB) is gone; the GPU
+  now matches the CPU within ~4 % on 1 MB and is ~20 % larger on 1 GB (the
+  per-block literal/table overhead paid 8192 times). Not yet within the ~5 %
+  1 GB target.
+- **G15 greedy strategy :** levels 3-4 now run the device path (verified
+  active) with ratio parity (167 B = 167 B at levels 3-4 on 1 MB).
+- **G16 MT :** `--multi --gpu` produces valid frames and matches the CPU ratio
+  within 0.3 % (100 MB rep : 9652 B vs 9623 B).
+- **G6 speed clause (GPU >= CPU for match finding) :** not yet met - the GPU is
+  2.5-25x slower end-to-end. The on-device greedy extension of long matches
+  (periodic) and the per-block launch/sync overhead (random) are the gaps to
+  close.
+

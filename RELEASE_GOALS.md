@@ -402,8 +402,28 @@ the device, LZDM/long-range mode on the GPU.
   `ZSTD_c_gpuMatchFinder` stays experimental.
 
 ## Immediate next steps (critical path)
-G1–G9 are done and tagged `v1.6.0.0` (2026-11-16). The critical path for
-the next release is the level-1 speed gap: **G10** (pipeline) → **G11**
-(batching) → **G12** (prefilter) → **G13** (device greedy), then **G14**
-(ratio), **G15**/**G16** (strategy coverage / MT), and **G17** to publish
-the new numbers and tag the release.
+G1–G9 are done and tagged `v1.6.0.0` (2026-11-16). Progress on the next
+release (2026-11-19):
+
+- **G10–G13 (pipeline / batching / prefilter / device greedy) :** in. The
+  on-device greedy had a regression (one thread stepped through every
+  position, ~18 ms/block on periodic) - fixed with a jump-optimized walk and
+  8-byte extension (~2 ms/block).
+- **G14 (ratio) :** the 5.8x baseline penalty (573 KB vs 98 KB on 1 GB) is
+  gone. The GPU now matches the CPU within ~4 % on 1 MB and is ~20 % larger
+  on 1 GB (per-block overhead paid 8192x). Not yet within the ~5 % 1 GB
+  target - the remaining gap is the per-block literal/table overhead, to be
+  closed by driving the GPU with the CCtx's larger block size.
+- **G15 (greedy strategy) :** levels 3-4 now run the device path (verified
+  active) with ratio parity. Speed is still below CPU (greedy-extension
+  bottleneck).
+- **G16 (MT) :** `--multi --gpu` now produces valid frames (the match finder
+  is reset on every context re-init / job) and matches the CPU ratio within
+  0.3 %.
+- **G17 (profiling + numbers) :** `ZSTD_GPU_PROFILE` per-phase timing is
+  fixed (events were read before completion) and the refreshed numbers are in
+  `doc/perf_results.md`.
+
+Remaining for the release: close the G14 1 GB ratio gap (larger GPU block
+size) and the G6 speed clause (GPU >= CPU) - the on-device greedy extension
+of long matches and the per-block launch/sync overhead are the gaps to close.
