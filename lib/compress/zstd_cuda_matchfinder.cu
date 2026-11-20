@@ -664,6 +664,7 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
 {
     if (!gpuMF) return 0;
     gpuProfReport(gpuMF);
+    ZSTD_gpuHostProfReport();   /* G20 : host-side phases, if enabled */
     /* Drain any in-flight work before freeing the buffers it touches
      * (the runtime fallback path can free the MF mid-frame). */
     if (gpuMF->stream) cudaStreamSynchronize(gpuMF->stream);

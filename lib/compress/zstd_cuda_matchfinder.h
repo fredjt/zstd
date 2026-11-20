@@ -228,6 +228,13 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF);
 size_t ZSTD_resetGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF);
 
 /**
+ * G20 : print the host-side per-block phase breakdown (total / gpuCall /
+ * seqStore) accumulated while ZSTD_GPU_HOSTPROF was set. No-op otherwise.
+ * Called automatically from ZSTD_freeGpuMatchFinder.
+ */
+void ZSTD_gpuHostProfReport(void);
+
+/**
  * Initialize the GPU match finder from CCtx parameters.
  * Called when GPU mode is first requested.
  */

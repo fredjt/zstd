@@ -36,6 +36,64 @@ static void ZSTD_storeLastLiterals_gpu(SeqStore_t* seqStorePtr, const BYTE* anch
 }
 
 /* ======================================================================== */
+/* G20 host-side profiling (ZSTD_GPU_HOSTPROF=1)                            */
+/* ======================================================================== */
+/*
+ * The device profile (ZSTD_GPU_PROFILE) measures the GPU phases. This
+ * measures the host-side phases of the same per-block path, to answer where
+ * the host time goes : is the host simply waiting on the GPU pipeline
+ * (confirming the device compute floor, G6), or is there host compute
+ * (the seqstore build) worth removing ? Phases (seconds, printed per 128 KB
+ * block when the match finder is freed) :
+ *   0 total    : whole ZSTD_buildSeqStore_gpu (from just before the
+ *                match-finding call to the end)
+ *   1 gpuCall  : the match-finding call (chunk or sync) - host time spent
+ *                inside it, i.e. waiting on the GPU pipeline
+ *   2 seqStore : seqstore reset + sequence conversion + literal copy
+ */
+#include <stdio.h>
+#include <time.h>
+static double gpuHostNowW(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static double   g_hp[3];
+static unsigned g_hpBlocks;
+static int      g_hpOn = -1;
+static int gpuHostProfOn(void)
+{
+    if (g_hpOn < 0) g_hpOn = (getenv("ZSTD_GPU_HOSTPROF") != NULL);
+    return g_hpOn;
+}
+/* Accumulate the seqStore (t1 -> now) and total (t0 -> now) phases. */
+static void gpuHostProfEnd(double t0, double t1)
+{
+    if (!gpuHostProfOn()) return;
+    {
+        double const t2 = gpuHostNowW();
+        g_hp[2] += t2 - t1;
+        g_hp[0] += t2 - t0;
+        g_hpBlocks++;
+    }
+}
+void ZSTD_gpuHostProfReport(void)
+{
+    if (!gpuHostProfOn() || g_hpBlocks == 0) return;
+    {
+        static const char* const names[3] = { "total", "gpuCall", "seqStore" };
+        double const total = g_hp[0];
+        fprintf(stderr, "[ZSTD_GPU_HOSTPROF] per 128KB block (avg over %u blocks)\n", g_hpBlocks);
+        for (int p = 0; p < 3; p++) {
+            double const avg = 1000.0 * g_hp[p] / (double)g_hpBlocks;
+            double const pct = (total > 0) ? 100.0 * g_hp[p] / total : 0.0;
+            fprintf(stderr, "  %-11s %9.4f ms  %5.1f%%\n", names[p], avg, pct);
+        }
+    }
+}
+
+/* ======================================================================== */
 /* GPU Match Finder Context Management                                       */
 /* ======================================================================== */
 
@@ -126,6 +184,7 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
      * advances nextWait per block and must therefore be called for every
      * block (even tiny ones). Otherwise fall back to the synchronous
      * single-block path. */
+    double const ht0 = gpuHostProfOn() ? gpuHostNowW() : 0;   /* G20 */
     size_t nbSeq;
     if (gpuMF->chunkMode)
     {
@@ -146,6 +205,8 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
         free(seqs);
         return nbSeq;
     }
+    double const ht1 = gpuHostProfOn() ? gpuHostNowW() : 0;   /* G20 */
+    if (gpuHostProfOn()) g_hp[1] += ht1 - ht0;
 
     /* Convert (position, offset, matchLength) to SeqDef format and write to
      * the sequence store. Each sequence owns the literals before its match
@@ -157,6 +218,7 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
     if (nbSeq == 0)
     {
         ZSTD_storeLastLiterals_gpu(&zc->seqStore, (const BYTE*) src, srcSize);
+        gpuHostProfEnd(ht0, ht1);
         free(seqs);
         return ZSTDbss_compress;
     }
@@ -212,6 +274,7 @@ size_t ZSTD_buildSeqStore_gpu(ZSTD_CCtx* zc, void const* src, const size_t srcSi
     /* zc->seqStore.lit now points just past the last copied literal, and
      * sequences points just past the last sequence. */
     zc->seqStore.sequences = zc->seqStore.sequencesStart + nbSeq;
+    gpuHostProfEnd(ht0, ht1);
 
     free(seqs);
     return ZSTDbss_compress;
