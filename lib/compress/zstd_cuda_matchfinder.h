@@ -163,11 +163,14 @@ struct ZSTD_GpuMatchFinder_s {
     /* G17 per-phase profiling (ZSTD_GPU_PROFILE=1). Eight phases (G18.2
      * removed the dead rowBounds phase) :
      * 0 H2D, 1 fillKeys, 2 radix, 3 recordSlot, 4 search, 5 insert,
-     * 6 greedy, 7 D2H. Times accumulate in ms. */
+     * 6 greedy, 7 D2H. Times accumulate in ms. The events are double-buffered
+     * by batch parity (G20.0) : with the chunk pipeline the next batch is
+     * submitted before the previous batch's events are read, so a single set
+     * would be overwritten. At most 2 batches are in flight, so parity is safe. */
     int         profile;
     double      phaseMs[8];
     unsigned    phaseCount;
-    cudaEvent_t profEv[16];
+    cudaEvent_t profEv[2][16];
 #else
     void* d_window;
     void* d_windowTmp;
@@ -190,6 +193,7 @@ struct ZSTD_GpuMatchFinder_s {
     void* evCompute[2];
     void* evD2H[2];
     void* evNbSeq[2];
+    void* profEv[2][16];
 #endif
 };
 
