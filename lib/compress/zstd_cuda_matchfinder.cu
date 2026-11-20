@@ -33,8 +33,9 @@
  *  - The search uses the CPU's exact fingerprint hash (minMatch-dependent),
  *    an 8-byte prefilter and a window-age check before the per-position count
  *    (G12). Greedy sequence resolution (non-overlapping, in position order)
- *    currently runs on the host over the D2H'd candidates (G13 moves it to
- *    the device).
+ *    runs on the device (G13) : a sequential walk per block that jumps past
+ *    each emitted match, with the match extension unrolled for memory-level
+ *    parallelism (G18.1).
  *
  * See doc/gpu_matchfinding_design.md for the full design rationale and the
  * tradeoffs vs. the CPU match finder.
@@ -366,15 +367,22 @@ __global__ void gpuInsert(const unsigned char* __restrict__ d_window, unsigned w
 }
 
 /* ======================================================================== */
-/* Device greedy : one thread per block scans its candidates and extends the
- * matches using the window (so cross-block matches are extended correctly).
+/* Device greedy (G18.1) : one warp (32 threads) per block walks the
+ * positions in order and emits non-overlapping matches, jumping past each
+ * emitted match (pib += len) instead of stepping through the covered
+ * positions. Thread 0 drives the sequential walk (finding the match-starts);
+ * the whole warp cooperatively extends each match : 32 lanes x 8 bytes =
+ * 256 bytes per round, so a whole-block match is ~512 rounds of coalesced
+ * 64-bit loads instead of 16K dependent single-thread steps. Before G18.1
+ * the extension was a single-thread byte/chunk loop, so a whole-block match
+ * cost ~1.9 ms per 128 KB block (~90 % of the batch).
+ *
+ * A first-mismatch scan (not a binary search) is required because the
+ * per-chunk equality is not monotonic : the data may match, mismatch, then
+ * match again. The match is capped at the block end, exactly like the CPU's
+ * ZSTD_count (the source always has the bytes : qc + maxLen < the block end
+ * < the window end).
  * ======================================================================== */
-/* Greedy resolution (one thread per block): walk the positions in order,
- * emitting non-overlapping matches. The walk jumps past each emitted match
- * (pib = pib + len) instead of stepping through the covered positions, so the
- * number of d_cand loads is O(number of matches + unmatched prefix), not O(block
- * size). Matches are extended in 8-byte chunks. Blocks with no candidates
- * (incompressible data) return immediately. */
 __global__ void gpuGreedy(const unsigned char* __restrict__ d_window, unsigned winBase,
                           const unsigned* __restrict__ d_blockMeta, unsigned B,
                           const unsigned* __restrict__ d_cand,
@@ -382,34 +390,80 @@ __global__ void gpuGreedy(const unsigned char* __restrict__ d_window, unsigned w
                           ZSTD_GpuSequence* __restrict__ d_seq,
                           unsigned* __restrict__ d_nbSeq)
 {
-    unsigned const i = blockIdx.x;
+    unsigned const i = blockIdx.x;   /* frame block */
     if (i >= B) return;
-    if (threadIdx.x != 0) return;   /* one thread per block */
+    __shared__ unsigned s_pib, s_off, s_len, s_state;   /* state : 0 = walk, 1 = done */
     unsigned const size = d_blockMeta[i*2+1];
     unsigned const absStart = d_blockMeta[i*2];
-    if (d_nbCand[i] == 0) { d_nbSeq[i] = 0; return; }
-    unsigned nbSeq = 0;
-    unsigned pib = 0;
-    while (pib + 1 < size) {
-        unsigned const off = d_cand[(i * ZSTD_GPU_BLOCKSIZE + pib) * 2];
-        if (off == 0) { pib++; continue; }
-        unsigned const a = absStart + pib;
-        unsigned const qc = a - off;   /* match source (within the window) */
-        unsigned char* const base = (unsigned char*)(d_window + (a - winBase));
-        unsigned char* const cend = base + (size - pib);
-        unsigned char* cp = base + ZSTD_GPU_MATCH_CAP;
-        unsigned char* cq = (unsigned char*)(d_window + (qc - winBase)) + ZSTD_GPU_MATCH_CAP;
-        unsigned len = ZSTD_GPU_MATCH_CAP;
-        while (cp + 8 <= cend && gpuRead64(cp) == gpuRead64(cq)) { cp += 8; cq += 8; len += 8; }
-        while (cp < cend && *cp == *cq) { cp++; cq++; len++; }
-        ZSTD_GpuSequence* const s = d_seq + (i * ZSTD_GPU_MAX_SEQS + nbSeq);
-        s->position = pib;
-        s->offset = off;
-        s->matchLength = len;
-        nbSeq++;
-        pib += len;   /* jump past the emitted match */
+    if (threadIdx.x == 0) {
+        s_pib = 0; s_off = 0; s_len = 0;
+        s_state = (d_nbCand[i] == 0) ? 1 : 0;
     }
-    d_nbSeq[i] = nbSeq;
+    __syncthreads();
+    if (s_state == 1) { if (threadIdx.x == 0) d_nbSeq[i] = 0; return; }
+
+    unsigned nbSeq = 0;
+    for (;;) {
+        /* Phase A : thread 0 finds the next match-start (or marks done). */
+        if (threadIdx.x == 0) {
+            unsigned pib = s_pib;
+            unsigned off = 0;
+            while (pib + 1 < size) {
+                off = d_cand[(i * ZSTD_GPU_BLOCKSIZE + pib) * 2];
+                if (off != 0) break;
+                pib++;
+            }
+            if (pib + 1 >= size) { s_state = 1; }
+            else { s_pib = pib; s_off = off; }
+        }
+        __syncthreads();
+        if (s_state == 1) break;
+        unsigned const pib = s_pib;
+        unsigned const off = s_off;
+        /* Phase B : the warp cooperatively extends the match at pib.
+         * The first 8 bytes are known equal (the search's prefilter), so the
+         * extension covers [8, maxLen). Round r covers [8+256r, 8+256r+256);
+         * lane L checks the 8 bytes at [8+256r+8L, +8). */
+        unsigned const a = absStart + pib;
+        unsigned const maxLen = size - pib;
+        const unsigned char* const base = d_window + (a - winBase);
+        const unsigned char* const srcp = d_window + (a - off - winBase);
+        unsigned len = ZSTD_GPU_MATCH_CAP;   /* 8 : the prefilter already matched */
+        while (len + 256 <= maxLen) {
+            unsigned const byteOff = len + threadIdx.x * 8;
+            unsigned long long const b = gpuRead64(base + byteOff);
+            unsigned long long const s = gpuRead64(srcp + byteOff);
+            unsigned const bal = __ballot_sync(0xFFFFFFFFu, b != s);
+            if (bal == 0) { len += 256; continue; }   /* all 32 chunks equal */
+            unsigned const lane = (unsigned)__ffs(bal) - 1;   /* first mismatching lane */
+            if (threadIdx.x == lane) {
+                unsigned local = len + lane * 8;
+                while (local < maxLen && base[local] == srcp[local]) local++;
+                s_len = local;
+            }
+            __syncthreads();
+            len = s_len;
+            break;
+        }
+        /* Byte tail : [len, maxLen) is < 264 bytes ; thread 0 finishes it. */
+        if (threadIdx.x == 0) {
+            while (len < maxLen && base[len] == srcp[len]) len++;
+            s_len = len;
+        }
+        __syncthreads();
+        len = s_len;
+        /* Phase C : thread 0 emits the sequence and advances the walk. */
+        if (threadIdx.x == 0) {
+            ZSTD_GpuSequence* const s = d_seq + (i * ZSTD_GPU_MAX_SEQS + nbSeq);
+            s->position = pib;
+            s->offset = off;
+            s->matchLength = len;
+            nbSeq++;
+            s_pib = pib + len;   /* jump past the emitted match */
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) d_nbSeq[i] = nbSeq;
 }
 
 
@@ -914,7 +968,7 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 (unsigned*)gpuMF->d_table);
 
             gpuProfRec(gpuMF, 14, gpuMF->stream);
-            gpuGreedy<<<count, 1, 0, gpuMF->stream>>>(
+            gpuGreedy<<<count, 32, 0, gpuMF->stream>>>(
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
                 (unsigned*)gpuMF->d_blockMeta, count,
                 (unsigned*)gpuMF->d_cand,
