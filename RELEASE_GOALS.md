@@ -507,15 +507,21 @@ The end-to-end numbers show the gap is **data-dependent**:
 | rep     | 0.168   | 1.138   | 6543      | 925       | 7.1x slower|
 | rnd     | 6.669   | 0.936   | 156       | 1113      | 7.1x faster|
 
-The GPU's per-block match-finding time is ~data-independent (0.0845 ms/block
-at B=4 on both rep and rnd: greedy 0.029, radix 0.025, H2D 0.010, insert
-0.008, search 0.005, recordSlot 0.004, fillKeys 0.002, D2H 0.001). The CPU's
-is strongly data-dependent: on rep (a 56-byte period) it finds one ~131 KB
-match per block and runs at 6.5 GB/s (0.0205 ms/block); on rnd it does a full
-hash lookup per position with no matches and runs at 156 MiB/s (0.814
-ms/block). So the GPU wins on rnd (where the CPU is slow) and loses on rep
-(where the CPU is trivially fast) - the G6 clause (GPU >= CPU) is met on rnd
-but not on rep.
+The GPU's per-block match-finding time is partly data-dependent (B=4):
+radix 0.025 (same on both), H2D+D2H 0.011, search+insert+recordSlot+fillKeys
+~0.019, and **greedy 0.029 on rep but only 0.0005 on rnd** - the greedy pays
+for extending the ~131 KB matches that rep data produces, and is trivial when
+there are no matches (rnd). Total: 0.0845 ms/block (rep) vs 0.0579 (rnd). The
+CPU's is strongly data-dependent: on rep (a 56-byte period) it finds one
+~131 KB match per block and runs at 6.5 GB/s (0.0205 ms/block); on rnd it
+does a full hash lookup per position with no matches and runs at 156 MiB/s
+(0.814 ms/block). So the GPU wins on rnd (where the CPU is slow) and loses on
+rep (where the CPU is trivially fast) - the G6 clause (GPU >= CPU) is met on
+rnd but not on rep. The rep gap (0.0845 vs 0.0205 ms/block) is the greedy
+(0.029, data-dependent) + the radix (0.025, data-independent) + the
+per-position work (0.030); a sort-free device search (removing the radix and
+folding the per-position steps) plus a cheaper long-match greedy is the path
+to closing it.
 
 Two findings sharpen the fix:
   1. **The CLI frame chunk limits the GPU look-ahead.** The zstd CLI feeds the
