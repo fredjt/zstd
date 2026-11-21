@@ -490,3 +490,44 @@ encoder. Follow-ups:
     radix sort): the only remaining path to making the per-block GPU time
     competitive (the radix sort is ~0.07 ms of the ~0.25 ms per-block GPU
     time).
+
+**G20.2 : host-side stage/submit/wait breakdown + the real G6 gap (2026-11-21,
+RTX 3070, Ryzen 9 8940HX, L1, -T1, 1 GB).** The G20.2 host profile splits the
+per-block `gpuCall` into stage (look-ahead staging memcpy), submit (batch H2D
++ launches) and wait (the per-block wait on the GPU pipeline). On 1 GB rep:
+of the 0.0966 ms/block host time, stage is 3.0%, submit 8.6%, **wait 88.3%**
+- the host is almost entirely waiting on the GPU pipeline, confirming the
+device compute is the G6 floor (the per-block host work is not the
+bottleneck).
+
+The end-to-end numbers show the gap is **data-dependent**:
+
+| dataset | CPU (s) | GPU (s) | CPU MiB/s | GPU MiB/s | GPU vs CPU |
+| ------- | ------- | ------- | --------- | --------- | ---------- |
+| rep     | 0.168   | 1.138   | 6543      | 925       | 7.1x slower|
+| rnd     | 6.669   | 0.936   | 156       | 1113      | 7.1x faster|
+
+The GPU's per-block match-finding time is ~data-independent (0.0845 ms/block
+at B=4 on both rep and rnd: greedy 0.029, radix 0.025, H2D 0.010, insert
+0.008, search 0.005, recordSlot 0.004, fillKeys 0.002, D2H 0.001). The CPU's
+is strongly data-dependent: on rep (a 56-byte period) it finds one ~131 KB
+match per block and runs at 6.5 GB/s (0.0205 ms/block); on rnd it does a full
+hash lookup per position with no matches and runs at 156 MiB/s (0.814
+ms/block). So the GPU wins on rnd (where the CPU is slow) and loses on rep
+(where the CPU is trivially fast) - the G6 clause (GPU >= CPU) is met on rnd
+but not on rep.
+
+Two findings sharpen the fix:
+  1. **The CLI frame chunk limits the GPU look-ahead.** The zstd CLI feeds the
+     buffered API in 512 KB frame chunks (4 blocks); the G19 chunk pipeline's
+     look-ahead is capped at the current chunk, so the CLI runs 4-block
+     batches (per-batch overhead amortized over 4 blocks, not 16). The
+     one-shot API (whole input = one chunk) gets the full 16-block batches and
+     is where G19 measured its 2.5-3.0x. Making the look-ahead span frame
+     chunks (stage from the CCtx's buffered input, not just the current chunk)
+     is a host-side win for the CLI path.
+  2. **The rep gap is the device compute floor.** Even with full 16-block
+     batches, the GPU's per-block time (greedy + radix dominate) is above the
+     CPU's rep per-block time. Closing it needs the sort-free device search
+     (drop the 0.025 ms/block radix) and a cheaper greedy on long matches -
+     the only path to GPU >= CPU on rep.
