@@ -50,6 +50,10 @@ static void ZSTD_storeLastLiterals_gpu(SeqStore_t* seqStorePtr, const BYTE* anch
  *   1 gpuCall  : the match-finding call (chunk or sync) - host time spent
  *                inside it, i.e. waiting on the GPU pipeline
  *   2 seqStore : seqstore reset + sequence conversion + literal copy
+ *   3 stage    : (chunk mode) look-ahead staging of blocks into the batch
+ *                buffers (host memcpy)
+ *   4 submit   : (chunk mode) batch submission (H2D + kernel launches)
+ *   5 wait     : (chunk mode) the per-block wait on the GPU pipeline
  */
 #include <stdio.h>
 #include <time.h>
@@ -59,13 +63,20 @@ static double gpuHostNowW(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
-static double   g_hp[3];
+static double   g_hp[6];
 static unsigned g_hpBlocks;
 static int      g_hpOn = -1;
 static int gpuHostProfOn(void)
 {
     if (g_hpOn < 0) g_hpOn = (getenv("ZSTD_GPU_HOSTPROF") != NULL);
     return g_hpOn;
+}
+/* G20.2 : phase accumulators callable from the .cu chunk path. */
+double ZSTD_gpuHostNow(void) { return gpuHostNowW(); }
+void ZSTD_gpuHostProfPhase(unsigned phase, double t0, double t1)
+{
+    if (!gpuHostProfOn() || phase >= 6) return;
+    g_hp[phase] += t1 - t0;
 }
 /* Accumulate the seqStore (t1 -> now) and total (t0 -> now) phases. */
 static void gpuHostProfEnd(double t0, double t1)
@@ -82,10 +93,11 @@ void ZSTD_gpuHostProfReport(void)
 {
     if (!gpuHostProfOn() || g_hpBlocks == 0) return;
     {
-        static const char* const names[3] = { "total", "gpuCall", "seqStore" };
+        static const char* const names[6] = { "total", "gpuCall", "seqStore",
+                                              "stage", "submit", "wait" };
         double const total = g_hp[0];
         fprintf(stderr, "[ZSTD_GPU_HOSTPROF] per 128KB block (avg over %u blocks)\n", g_hpBlocks);
-        for (int p = 0; p < 3; p++) {
+        for (int p = 0; p < 6; p++) {
             double const avg = 1000.0 * g_hp[p] / (double)g_hpBlocks;
             double const pct = (total > 0) ? 100.0 * g_hp[p] / total : 0.0;
             fprintf(stderr, "  %-11s %9.4f ms  %5.1f%%\n", names[p], avg, pct);

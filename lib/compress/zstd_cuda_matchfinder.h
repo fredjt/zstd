@@ -229,10 +229,15 @@ size_t ZSTD_resetGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF);
 
 /**
  * G20 : print the host-side per-block phase breakdown (total / gpuCall /
- * seqStore) accumulated while ZSTD_GPU_HOSTPROF was set. No-op otherwise.
- * Called automatically from ZSTD_freeGpuMatchFinder.
+ * seqStore / stage / submit / wait) accumulated while ZSTD_GPU_HOSTPROF was
+ * set. No-op otherwise. Called automatically from ZSTD_freeGpuMatchFinder.
  */
 void ZSTD_gpuHostProfReport(void);
+
+/* G20.2 : host-clock + phase accumulator for the .cu chunk path. No-ops
+ * unless ZSTD_GPU_HOSTPROF is set. Phases: 3 stage, 4 submit, 5 wait. */
+double ZSTD_gpuHostNow(void);
+void ZSTD_gpuHostProfPhase(unsigned phase, double t0, double t1);
 
 /**
  * Initialize the GPU match finder from CCtx parameters.

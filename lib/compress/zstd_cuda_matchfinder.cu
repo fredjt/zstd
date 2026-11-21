@@ -1170,12 +1170,17 @@ size_t ZSTD_gpuChunk_processBlock(ZSTD_GpuMatchFinder* gpuMF, ZSTD_GpuSequence* 
     if (!gpuMF || !dst) return ERROR(GPU_invalidParameter);
     {
         unsigned const g = gpuMF->nextWait;
+        double const p0 = ZSTD_gpuHostNow();
         FORWARD_IF_ERROR(gpuChunk_stageLookahead(gpuMF, g), "GPU chunk stage failed");
+        double const p1 = ZSTD_gpuHostNow();
         /* If the current block is still in the unsubmitted batch (the look-ahead
          * was limited by the chunk end), submit it (partial) so the GPU has it. */
         if (g >= gpuMF->curBatchStart) {
             FORWARD_IF_ERROR(gpuChunk_submitBatch(gpuMF), "GPU chunk batch submit failed");
         }
+        double const p2 = ZSTD_gpuHostNow();
+        ZSTD_gpuHostProfPhase(3, p0, p1);   /* G20.2 : staging */
+        ZSTD_gpuHostProfPhase(4, p1, p2);   /* G20.2 : submit */
         /* Map the global block index to (batchIdx, in-batch index) via the
          * 2-slot submitted-batch history. */
         {
@@ -1194,7 +1199,10 @@ size_t ZSTD_gpuChunk_processBlock(ZSTD_GpuMatchFinder* gpuMF, ZSTD_GpuSequence* 
             /* Waiting on the batch's last block frees a pipeline slot. */
             if (blockInBatch + 1 == gpuMF->histCount[slot]) gpuMF->inFlight--;
             gpuMF->nextWait++;
-            return ZSTD_gpuBatch_waitBlock(gpuMF, batchIdx, blockInBatch, dst, dstCapacity, NULL, 0);
+            double const w0 = ZSTD_gpuHostNow();
+            size_t const r = ZSTD_gpuBatch_waitBlock(gpuMF, batchIdx, blockInBatch, dst, dstCapacity, NULL, 0);
+            ZSTD_gpuHostProfPhase(5, w0, ZSTD_gpuHostNow());   /* G20.2 : wait */
+            return r;
         }
     }
 }
