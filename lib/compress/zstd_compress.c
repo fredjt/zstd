@@ -4732,13 +4732,20 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
 #ifdef ZSTD_CUDA
         size_t const blockSize = gpuChunk ?
             MIN(remaining, ZSTD_BLOCKSIZE_MAX) :
-#endif
             ZSTD_optimalBlockSize(cctx,
                                 ip, remaining,
                                 blockSizeMax,
                                 cctx->appliedParams.preBlockSplitter_level,
                                 cctx->appliedParams.cParams.strategy,
                                 savings);
+#else
+        size_t const blockSize = ZSTD_optimalBlockSize(cctx,
+                                ip, remaining,
+                                blockSizeMax,
+                                cctx->appliedParams.preBlockSplitter_level,
+                                cctx->appliedParams.cParams.strategy,
+                                savings);
+#endif
         U32 const lastBlock = lastFrameChunk & (blockSize == remaining);
         assert(blockSize <= remaining);
 
