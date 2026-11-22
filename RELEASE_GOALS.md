@@ -487,9 +487,10 @@ encoder. Follow-ups:
     estimate, because the look-ahead also hides the H2D latency of the next
     batch behind the current batch's compute;
   - a sort-free device search (per-hash in-batch predecessor without the
-    radix sort): the only remaining path to making the per-block GPU time
-    competitive (the radix sort is ~0.07 ms of the ~0.25 ms per-block GPU
-    time).
+    radix sort): **done (G21)** - the radix is replaced by a single-pass
+    counting sort (fill+hist, row scan, scatter); per-block GPU time 1.24x
+    (rep) / 1.47x (rnd) faster. See G21 for the phase breakdown and the
+    known compression-ratio tradeoff on periodic data.
 
 **G20.2 : host-side stage/submit/wait breakdown + the real G6 gap (2026-11-21,
 RTX 3070, Ryzen 9 8940HX, L1, -T1, 1 GB).** The G20.2 host profile splits the
@@ -537,3 +538,70 @@ Two findings sharpen the fix:
      CPU's rep per-block time. Closing it needs the sort-free device search
      (drop the 0.025 ms/block radix) and a cheaper greedy on long matches -
      the only path to GPU >= CPU on rep.
+
+**G21 : sort-free device search - the radix is gone (2026-11-22, RTX 3060,
+L1, -T1, 16 MB).** The per-hash in-batch predecessor no longer needs a radix
+sort. The batch's positions are grouped into per-hash rows by a single-pass
+counting sort: `gpuFillHist` computes each position's fingerprint once and
+caches it (packed `(absPos, hash)` in `d_posHash`) plus a per-hash histogram;
+a two-level exclusive scan of the histogram gives the row starts; `gpuScatter`
+places each position's word into its row (an atomicAdd slot) and records
+`d_slot`. The search then takes the candidate = max(in-batch row predecessor,
+pre-batch table entry) exactly as before, but reads the predecessor's
+`(absPos, hash)` from one 8-byte load and neither the search nor the insert
+re-hashes the window or re-runs the block-locate loop (the frame-block index
+is derived from the absolute position). This removes the 2-pass radix (8
+launches) + `recordSlot` and replaces them with fill+hist, 3-6 small scan
+kernels, and the scatter.
+
+Per-batch phase times (B=16, avg over 32 batches; the 3060 is shared with a
+llama-server, so absolute numbers run above the 3070 figures - compare
+before/after on the same GPU):
+
+| phase      | rep before | rep after | rnd before | rnd after |
+| ---------- | ---------- | --------- | ---------- | --------- |
+| H2D        | 0.0581     | 0.0596    | 0.0589     | 0.0605    |
+| fillKeys   | 0.0384     | -         | 0.0343     | -         |
+| radix      | 0.2716     | -         | 0.2717     | -         |
+| recordSlot | 0.1252     | -         | 0.1243     | -         |
+| fillHist   | -          | 0.0694    | -          | 0.0525    |
+| rowScan    | -          | 0.0105    | -          | 0.0103    |
+| scatter    | -          | 0.1029    | -          | 0.1559    |
+| search     | 0.0575     | 0.0765    | 0.1145     | 0.1137    |
+| insert     | 0.0531     | 0.0539    | 0.0349     | 0.0369    |
+| greedy     | 0.1274     | 0.2146    | 0.0033     | 0.0033    |
+| D2H        | 0.0085     | 0.0082    | 0.0083     | 0.0084    |
+| **total**  | **0.7399** | **0.5957**| **0.6503** | **0.4414**|
+| /block     | 0.0462     | 0.0372    | 0.0406     | 0.0276    |
+
+The sort phase (fillKeys+radix+recordSlot = 0.435 ms/batch) is replaced by
+fillHist+rowScan+scatter = 0.183 ms/batch (rep) / 0.219 (rnd) - a 2.4x/1.9x
+reduction. **Per-block GPU time: rep 0.0462 -> 0.0372 ms (1.24x), rnd 0.0406
+-> 0.0276 ms (1.47x).**
+
+Two caveats:
+  1. **The row order is approximate, not exact.** The scatter's atomicAdd
+     order follows warp-schedule order, not position order: on a 57-byte
+     period, 49.9% of adjacent row pairs are out of order (max displacement
+     ~737 periods). So the in-batch predecessor is usually *not* the closest
+     previous same-hash position, and the search falls back to the pre-batch
+     table entry (far from `t` mid-batch). A full-hash counting sort can't be
+     made stable without the radix's per-digit prefix (the per-block x
+     per-hash prefix is too large for shared memory).
+  2. **Compression ratio regresses on periodic data** (a consequence of #1):
+     rep16M 4507 -> 4616 B (+2.4%), g6b16mb.txt 3905 -> 4504 B (+15%),
+     oneMB.txt 539 -> 458 B (-15%), dup.bin unchanged. Random data is
+     byte-identical to the old GPU and to the CPU. Note the old GPU was
+     already not byte-identical to the CPU on periodic data (the CPU finds
+     one file-spanning match; the GPU caps/extends per position) - rep16M
+     CPU 1601 B vs old GPU 4507 B - so the "within ~5% of CPU greedy" clause
+     was already unmet on purely-periodic inputs before this change.
+
+Correctness: G5 suite passes (all sizes/contents/levels, stdin, CPU
+fallback); 16 MB rep/rnd roundtrip byte-identical. End-to-end on 1 GB rep is
+unchanged (1.94 -> 1.93 s) because the per-block GPU compute is only ~16% of
+the per-block end-to-end (host overhead + H2D/D2H + the CLI's 4-block batches
+dominate); the per-block GPU time is the G6 floor and is what this change
+targets. The remaining rep gap is the greedy (0.215 ms/batch on rep, vs
+0.003 on rnd) - a cheaper long-match greedy is the next step to GPU >= CPU on
+rep.

@@ -89,9 +89,6 @@ struct ZSTD_GpuMatchFinder_s {
     unsigned minMatch;
     unsigned mls;          /**< fingerprint length (== minMatch, clamped 4..8) */
     unsigned B;            /**< blocks per batch */
-    unsigned posBits;      /**< bits for the in-batch position field */
-    unsigned nPasses;      /**< radix passes over the hash bits */
-    unsigned nBlocksMax;   /**< max CUDA blocks per batch (B*512) */
 
     /* Window / frame state (host-authoritative) */
     unsigned winBase;      /**< absolute position of d_window[0] */
@@ -130,18 +127,29 @@ struct ZSTD_GpuMatchFinder_s {
     unsigned char* d_window;          /**< device sliding window (windowSize + 128 KB) */
     unsigned char* d_windowTmp;       /**< temp buffer for the overlapping window slide */
     unsigned*      d_table;           /**< persistent fingerprint -> latest pos+1 */
-    unsigned long long* d_keyA;       /**< sort keys (fill buffer) */
-    unsigned long long* d_keyB;       /**< sort ping-pong buffer */
-    unsigned*      d_slot;            /**< in-batch position -> sorted index */
-    unsigned*      d_rowStart;        /**< per-hash row start (whole batch) */
+    unsigned long long* d_keyA;       /**< sort-free: (absPos,hash) words grouped by hash row */
+    unsigned long long* d_keyB;       /**< (retained; unused by the sort-free path) */
+    unsigned*      d_slot;            /**< in-batch position -> index in the d_keyA row array */
+    unsigned*      d_rowStart;        /**< per-hash row start in d_keyA (whole batch) */
     unsigned*      d_rowEnd;          /**< per-hash row end (whole batch) */
-    unsigned*      d_blockHist;       /**< radix per-CUDA-block histogram [nBlocks][256] */
-    unsigned*      d_blockStartLocal; /**< radix within-group exclusive prefix [nBlocks][256] */
-    unsigned*      d_blockCounter;    /**< radix scatter counters [nBlocks][256] */
-    unsigned*      d_groupTotal;      /**< radix per-group digit totals [nGroups][256] */
-    unsigned*      d_groupPrefix;     /**< radix group prefix [nGroups][256] */
-    unsigned*      d_digitTotal;      /**< radix digit totals [256] */
-    unsigned*      d_digitStart;      /**< radix digit global starts [256] */
+    /* Sort-free device search (G6): per-position scratch + per-hash row state.
+     * d_posHash packs (absolute position, fingerprint) into one 64-bit word
+     * ((absPos << 32) | hash) and is filled in one pass (gpuFillHist); the
+     * scatter copies it into the row array (d_keyA), so the search reads the
+     * predecessor's (absPos, hash) from a single 8-byte load and neither the
+     * search nor the insert re-hashes the window or re-runs the block-locate
+     * loop (the frame-block index is derived from the absolute position). d_hist
+     * is the per-hash count; d_rowStart is its exclusive prefix (the row
+     * starts); d_rowCounter is the scatter write pointer (zeroed per batch).
+     * The d_blockTotal/d_blockPrefix and d_subTotal/d_subPrefix pairs are the
+     * two-level exclusive scan of d_hist. */
+    unsigned long long* d_posHash;    /**< per-position (absPos<<32)|hash [totalPos] */
+    unsigned*      d_hist;            /**< per-hash position count [1<<hashLog] */
+    unsigned*      d_rowCounter;      /**< scatter write pointers [1<<hashLog] */
+    unsigned*      d_blockTotal;      /**< row-scan per-block totals [nScanBlocks] */
+    unsigned*      d_blockPrefix;     /**< row-scan per-block exclusive prefix [nScanBlocks] */
+    unsigned*      d_subTotal;        /**< row-scan sub-block totals [nSubBlocks] */
+    unsigned*      d_subPrefix;       /**< row-scan sub-block exclusive prefix [nSubBlocks] */
     unsigned*      d_cand;            /**< per-position candidates [B][128K] x (off,len) */
     unsigned*      d_seq[2];          /**< final sequences [B][MAX_SEQS] x 12 B (double-buffered per batch parity: the next batch's greedy must not overwrite a batch whose D2H is still in flight) */
     unsigned*      d_nbSeq[2];        /**< per-block sequence count [B] (double-buffered, same reason) */
@@ -160,9 +168,10 @@ struct ZSTD_GpuMatchFinder_s {
     cudaEvent_t evD2H[2];
     cudaEvent_t evNbSeq[2];           /**< nbSeq D2H done (per buffer) */
 
-    /* G17 per-phase profiling (ZSTD_GPU_PROFILE=1). Eight phases (G18.2
-     * removed the dead rowBounds phase) :
-     * 0 H2D, 1 fillKeys, 2 radix, 3 recordSlot, 4 search, 5 insert,
+    /* G17 per-phase profiling (ZSTD_GPU_PROFILE=1). Eight phases (G6
+     * sort-free search replaced fillKeys/radix/recordSlot with
+     * fillHist/rowScan/scatter) :
+     * 0 H2D, 1 fillHist, 2 rowScan, 3 scatter, 4 search, 5 insert,
      * 6 greedy, 7 D2H. Times accumulate in ms. The events are double-buffered
      * by batch parity (G20.0) : with the chunk pipeline the next batch is
      * submitted before the previous batch's events are read, so a single set
@@ -179,10 +188,15 @@ struct ZSTD_GpuMatchFinder_s {
     void* d_slot;
     void* d_rowStart;
     void* d_rowEnd;
+    void* d_posHash;
+    void* d_hist;
+    void* d_rowCounter;
+    void* d_blockTotal;
+    void* d_blockPrefix;
+    void* d_subTotal;
+    void* d_subPrefix;
     void* d_cand;
     void* d_nbCand;
-    void* d_blockHist;
-    void* d_digitStart;
     void* h_cand[2];
     void* h_staging[2];
     void* h_nbSeq[2];

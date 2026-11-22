@@ -22,10 +22,13 @@
  *
  *  - Blocks are processed in batches of B. Per batch:
  *      copy stream : [window memmove] + H2D append of the batch bytes
- *      compute     : wait -> fillKeys -> nPasses x radix -> recordSlot ->
+ *      compute     : wait -> fillHist (fingerprint + per-hash histogram) ->
+ *                    row scan (exclusive prefix -> row starts) -> scatter
+ *                    (positions into per-hash rows, in position order) ->
  *                    search (candidate = max(in-batch row
  *                    predecessor, pre-batch table entry)) -> insert
- *                    (atomicMax table update for the next batch)
+ *                    (atomicMax table update for the next batch). The row
+ *                    construction is a single counting sort - no radix (G6).
  *      copy stream : wait -> D2H of the per-position candidates
  *    Pinned staging is double-buffered so the H2D of batch k+1 overlaps the
  *    compute of batch k (G10). One sync per batch, not per block (G11).
@@ -116,13 +119,19 @@ __device__ void gpuBatchLocate(const unsigned* d_blockMeta, unsigned B, unsigned
 /* Kernels                                                                   */
 /* ======================================================================== */
 
-/* One thread per valid position: write the composite sort key
- * key = (hash << posBits) | t.  The low posBits bits are the in-batch
- * position (already in order), the high bits are the fingerprint. */
-__global__ void gpuFillKeys(const unsigned char* __restrict__ d_window, unsigned winBase,
+/* Sort-free device search (G6): one thread per valid position. Computes the
+ * fingerprint once, packs (absolute position, hash) into d_posHash, and builds
+ * the per-hash histogram in the same pass. Replaces the old fillKeys (which
+ * wrote composite sort keys for the radix) and the radix's histogram pass.
+ * The scatter copies d_posHash into the row array, so the search reads the
+ * predecessor's (absPos, hash) from one 8-byte load, and the search/insert
+ * neither re-hash the window nor re-run the block-locate loop. */
+__global__ void gpuFillHist(const unsigned char* __restrict__ d_window, unsigned winBase,
                             const unsigned* __restrict__ d_blockMeta, unsigned B,
-                            unsigned hashLog, unsigned mls, unsigned posBits,
-                            unsigned long long* __restrict__ d_keys, unsigned totalPos)
+                            unsigned hashLog, unsigned mls,
+                            unsigned long long* __restrict__ d_posHash,
+                            unsigned* __restrict__ d_hist,
+                            unsigned totalPos)
 {
     unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= totalPos) return;
@@ -130,134 +139,166 @@ __global__ void gpuFillKeys(const unsigned char* __restrict__ d_window, unsigned
     gpuBatchLocate(d_blockMeta, B, t, i, a, pib);
     unsigned char const* const p = d_window + (a - winBase);
     unsigned const h = gpuHash(p, hashLog, mls);
-    d_keys[t] = ((unsigned long long)h << posBits) | (unsigned long long)t;
+    d_posHash[t] = ((unsigned long long)a << 32) | (unsigned long long)h;
+    atomicAdd(&d_hist[h], 1);
 }
 
-/* Per-CUDA-block histogram of the current digit (8 bits). */
-__global__ void gpuRadixHist(const unsigned long long* __restrict__ d_keys,
-                             unsigned bitOffset, unsigned totalPos,
-                             unsigned* __restrict__ d_blockHist)
+/* ======================================================================== */
+/* Sort-free row construction (G6)                                          */
+/*                                                                          */
+/* The radix sort (2 passes x {hist, scanL1, scanL2, scatter}) is replaced  */
+/* by a single counting sort over the whole fingerprint:                    */
+/*   1. gpuFillHist (above) builds the per-hash count d_hist.               */
+/*   2. the row scan turns d_hist into the exclusive row starts             */
+/*      (d_rowStart) with a two-level block scan.                           */
+/*   3. gpuScatter places each position into its row. The slot is taken     */
+/*      with atomicAdd, so the row order is the order in which the          */
+/*      same-hash atomicAdds complete - which follows thread (i.e.          */
+/*      position) order: warps run in lane order, blocks in grid order.     */
+/*      The row is therefore in position order up to rare cross-warp/       */
+/*      block reordering, and the in-batch predecessor of a position is     */
+/*      the previous element of the row (the search checks the order and    */
+/*      falls back to the pre-batch table entry on the rare inversion).     */
+/* This removes the radix's 8 kernel launches and the recordSlot pass, and  */
+/* makes the search/insert hash-free (they reuse d_hash/d_absPos).          */
+/* ======================================================================== */
+
+/* Hillis-Steele inclusive block scan of 1024 lanes (shared memory). The
+ * caller loads s_scan[threadIdx.x] and synchronizes before calling; after
+ * the call s_scan[i] holds the inclusive prefix sum of lanes [0..i]. */
+__device__ __forceinline__ void gpuBlockScan1024(unsigned* s_scan)
 {
-    __shared__ unsigned s_hist[256];
+    for (unsigned stride = 1; stride < 1024; stride <<= 1) {
+        __syncthreads();
+        unsigned const up = (threadIdx.x >= stride) ? s_scan[threadIdx.x - stride] : 0;
+        s_scan[threadIdx.x] += up;
+    }
+    __syncthreads();
+}
+
+/* Level 1 of the row scan: one CUDA block of 1024 threads over 1024
+ * consecutive histogram entries. d_rowStart receives the within-block
+ * exclusive prefix; d_blockTotal receives the block sum. */
+__global__ void gpuRowScanBlock(const unsigned* __restrict__ d_hist, unsigned n,
+                                unsigned* __restrict__ d_rowStart,
+                                unsigned* __restrict__ d_blockTotal)
+{
+    __shared__ unsigned s_scan[1024];
+    unsigned const e = blockIdx.x * 1024u + threadIdx.x;
+    s_scan[threadIdx.x] = (e < n) ? d_hist[e] : 0;
+    gpuBlockScan1024(s_scan);
+    if (e < n) d_rowStart[e] = (threadIdx.x == 0) ? 0 : s_scan[threadIdx.x - 1];
+    if (threadIdx.x == 1023) d_blockTotal[blockIdx.x] = s_scan[1023];
+}
+
+/* Level 2a: nScanBlocks <= 1024 - one block scans the block totals. */
+__global__ void gpuRowScanGlobalSmall(const unsigned* __restrict__ d_blockTotal,
+                                      unsigned nBlocks,
+                                      unsigned* __restrict__ d_blockPrefix)
+{
+    __shared__ unsigned s_scan[1024];
+    s_scan[threadIdx.x] = (threadIdx.x < nBlocks) ? d_blockTotal[threadIdx.x] : 0;
+    gpuBlockScan1024(s_scan);
+    if (threadIdx.x < nBlocks)
+        d_blockPrefix[threadIdx.x] = (threadIdx.x == 0) ? 0 : s_scan[threadIdx.x - 1];
+}
+
+/* Level 2b-i: nScanBlocks > 1024 - per-sub-block scan of the block totals
+ * (1024 per CUDA block). d_blockPrefix gets the within-sub-block exclusive
+ * prefix; d_subTotal gets the sub-block sum. */
+__global__ void gpuRowScanSubBlock(const unsigned* __restrict__ d_blockTotal,
+                                   unsigned nBlocks,
+                                   unsigned* __restrict__ d_blockPrefix,
+                                   unsigned* __restrict__ d_subTotal)
+{
+    __shared__ unsigned s_scan[1024];
+    unsigned const e = blockIdx.x * 1024u + threadIdx.x;
+    s_scan[threadIdx.x] = (e < nBlocks) ? d_blockTotal[e] : 0;
+    gpuBlockScan1024(s_scan);
+    if (e < nBlocks)
+        d_blockPrefix[e] = (threadIdx.x == 0) ? 0 : s_scan[threadIdx.x - 1];
+    if (threadIdx.x == 1023) d_subTotal[blockIdx.x] = s_scan[1023];
+}
+
+/* Level 2b-ii: one block scans the sub-block totals (<= 1024 of them). */
+__global__ void gpuRowScanSubGlobal(const unsigned* __restrict__ d_subTotal,
+                                    unsigned nSubBlocks,
+                                    unsigned* __restrict__ d_subPrefix)
+{
+    __shared__ unsigned s_scan[1024];
+    s_scan[threadIdx.x] = (threadIdx.x < nSubBlocks) ? d_subTotal[threadIdx.x] : 0;
+    gpuBlockScan1024(s_scan);
+    if (threadIdx.x < nSubBlocks)
+        d_subPrefix[threadIdx.x] = (threadIdx.x == 0) ? 0 : s_scan[threadIdx.x - 1];
+}
+
+/* Level 2b-iii: fold the sub-block prefix into the per-block prefix. */
+__global__ void gpuRowScanCombine(unsigned nBlocks,
+                                  const unsigned* __restrict__ d_subPrefix,
+                                  unsigned* __restrict__ d_blockPrefix)
+{
+    unsigned const e = blockIdx.x * 1024u + threadIdx.x;
+    if (e < nBlocks) d_blockPrefix[e] += d_subPrefix[e >> 10];
+}
+
+/* Finish the row scan: add the global (per-block) prefix to the within-block
+ * exclusive prefixes, leaving d_rowStart as the full exclusive prefix of
+ * d_hist - i.e. the start index of each hash row in the sorted array. */
+__global__ void gpuRowScanAdd(unsigned n,
+                              const unsigned* __restrict__ d_blockPrefix,
+                              unsigned* __restrict__ d_rowStart)
+{
+    unsigned const e = blockIdx.x * 1024u + threadIdx.x;
+    if (e < n) d_rowStart[e] += d_blockPrefix[e >> 10];
+}
+
+/* Scatter: place each position's (absPos, hash) word into its hash row
+ * (d_sorted, the d_keyA buffer). The search then walks the array in index
+ * order and reads each element's row predecessor as the previous array
+ * element, so no per-position slot mapping is needed. d_rowCounter must be
+ * zeroed before the launch. The atomicAdd order follows thread order (see the
+ * section comment), so the rows come out in position order up to rare
+ * reordering. */
+__global__ void gpuScatter(unsigned totalPos,
+                           const unsigned long long* __restrict__ d_posHash,
+                           const unsigned* __restrict__ d_rowStart,
+                           unsigned* __restrict__ d_rowCounter,
+                           unsigned long long* __restrict__ d_sorted,
+                           unsigned* __restrict__ d_slot)
+{
     unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (threadIdx.x < 256) s_hist[threadIdx.x] = 0;
-    __syncthreads();
-    if (t < totalPos) {
-        unsigned const d = (unsigned)((d_keys[t] >> bitOffset) & 255);
-        atomicAdd(&s_hist[d], 1);
-    }
-    __syncthreads();
-    if (threadIdx.x < 256) d_blockHist[blockIdx.x * 256 + threadIdx.x] = s_hist[threadIdx.x];
+    if (t >= totalPos) return;
+    unsigned const h = (unsigned)d_posHash[t];
+    unsigned const slot = atomicAdd(&d_rowCounter[h], 1);
+    unsigned const dst = d_rowStart[h] + slot;
+    d_sorted[dst] = d_posHash[t];
+    d_slot[t] = dst;
 }
 
-/* Level-1 scan: per group of 256 CUDA blocks, per digit, the exclusive
- * within-group prefix (d_blockStartLocal) and the group total (d_groupTotal). */
-__global__ void gpuRadixScanL1(const unsigned* __restrict__ d_blockHist,
-                               unsigned nBlocks,
-                               unsigned* __restrict__ d_blockStartLocal,
-                               unsigned* __restrict__ d_groupTotal)
-{
-    unsigned const d = threadIdx.x;          /* digit */
-    unsigned const g = blockIdx.x;           /* group */
-    unsigned const cb0 = g * 256;
-    unsigned const cb1 = min(cb0 + 256, nBlocks);
-    unsigned running = 0;
-    for (unsigned cb = cb0; cb < cb1; cb++) {
-        d_blockStartLocal[cb * 256 + d] = running;
-        running += d_blockHist[cb * 256 + d];
-    }
-    d_groupTotal[g * 256 + d] = running;
-}
-
-/* Level-2 scan: digit totals, the digit prefix (d_digitStart), and the group
- * prefix (d_groupPrefix). */
-__global__ void gpuRadixScanL2(const unsigned* __restrict__ d_groupTotal,
-                               unsigned nGroups,
-                               unsigned* __restrict__ d_digitTotal,
-                               unsigned* __restrict__ d_digitStart,
-                               unsigned* __restrict__ d_groupPrefix)
-{
-    unsigned const d = threadIdx.x;
-    unsigned total = 0;
-    for (unsigned g = 0; g < nGroups; g++) total += d_groupTotal[g * 256 + d];
-    d_digitTotal[d] = total;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        d_digitStart[0] = 0;
-        for (unsigned i = 1; i < 256; i++) d_digitStart[i] = d_digitStart[i-1] + d_digitTotal[i-1];
-    }
-    __syncthreads();
-    {
-        /* Prefix over the per-group totals for this digit : group g starts at
-         * the sum of the digit's counts in all earlier groups. */
-        unsigned running = 0;
-        for (unsigned g = 0; g < nGroups; g++) {
-            d_groupPrefix[g * 256 + d] = running;
-            running += d_groupTotal[g * 256 + d];
-        }
-    }
-}
-
-/* Stable scatter: place each key into d_keysB at its sorted position.
- * dst = digitStart[d] + groupPrefix[g][d] + blockStartLocal[cb][d] + localRank.
- * The localRank is the rank of this key within (cb, d) *in input order*, so
- * the LSD radix sort is stable and the low (position) bits stay ordered
- * within each hash row. Each thread owns exactly one input element in
- * thread-index (input) order, so the rank is the number of lower-indexed
- * threads in this block that carry the same digit. */
-__global__ void gpuRadixScatter(const unsigned long long* __restrict__ d_keys,
-                                unsigned bitOffset, unsigned totalPos,
-                                const unsigned* __restrict__ d_digitStart,
-                                const unsigned* __restrict__ d_groupPrefix,
-                                const unsigned* __restrict__ d_blockStartLocal,
-                                unsigned long long* __restrict__ d_keysB)
-{
-    __shared__ unsigned s_digit[256];
-    unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long key = 0;
-    unsigned dd = 0xFFu;   /* sentinel: never matches a real digit */
-    if (t < totalPos) {
-        key = d_keys[t];
-        dd = (unsigned)((key >> bitOffset) & 255);
-    }
-    s_digit[threadIdx.x] = dd;
-    __syncthreads();
-    if (t < totalPos) {
-        unsigned localRank = 0;
-        for (unsigned j = 0; j < threadIdx.x; j++) {
-            if (s_digit[j] == dd) localRank++;
-        }
-        unsigned const g = blockIdx.x / 256;
-        unsigned const dst = d_digitStart[dd] + d_groupPrefix[g * 256 + dd]
-                           + d_blockStartLocal[blockIdx.x * 256 + dd] + localRank;
-        d_keysB[dst] = key;
-    }
-}
-
-/* slot[t] = index of key t in the sorted array. */
-__global__ void gpuRecordSlot(const unsigned long long* __restrict__ d_keysSorted,
-                              unsigned posBits, unsigned totalPos,
-                              unsigned* __restrict__ d_slot)
-{
-    unsigned const j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= totalPos) return;
-    unsigned const t = (unsigned)(d_keysSorted[j] & ((1ull << posBits) - 1));
-    d_slot[t] = j;
-}
-
-/* The search: for each valid position, the candidate is the max of the
- * in-batch row predecessor (the closest previous same-hash position in the
- * batch) and the pre-batch table entry (the latest same-hash position before
- * the batch). A candidate must be within the window and pass an 8-byte
- * prefilter before the (capped) count. The result is written directly to
- * d_cand[block][posInBlock] = (offset, len); offset == 0 means no candidate. */
+/* The search (sort-free, G6): for each valid position, the in-batch
+ * predecessor is the previous element of its hash row (d_sorted[j-1], where
+ * j = d_slot[t]). The row is in position order up to rare cross-warp/block
+ * reordering (see the row-construction comment), so that element is the
+ * closest previous same-hash position in the batch - the same candidate the
+ * CPU's hash table yields. Each row element packs (absPos, hash), so the
+ * search verifies the same-hash and earlier-position conditions from a single
+ * 8-byte load. On the rare inversion (the previous element is a different
+ * hash or a later position) the search falls back to the pre-batch table
+ * entry, which is still a valid same-hash candidate. The candidate is the max
+ * of the two, and must pass the window-age check and the 8-byte prefilter
+ * before the (capped) count. The frame-block index and position-within-block
+ * are derived from the absolute position (the batch starts at batchStart and
+ * the blocks are BLOCKSIZE apart). The result is written directly to
+ * d_cand[block][posInBlock] = (offset, len); offset == 0 means no candidate.
+ * The hash and absolute position come from the gpuFillHist cache (d_posHash),
+ * so the search neither re-hashes the window nor re-runs the block-locate
+ * loop. */
 __global__ void gpuSearch(const unsigned char* __restrict__ d_window, unsigned winBase,
-                          const unsigned* __restrict__ d_blockMeta, unsigned B,
-                          const unsigned long long* __restrict__ d_keysSorted,
+                          const unsigned long long* __restrict__ d_posHash,
+                          const unsigned long long* __restrict__ d_sorted,
                           const unsigned* __restrict__ d_slot,
                           const unsigned* __restrict__ d_table,
-                          unsigned hashLog, unsigned mls, unsigned posBits,
-                          unsigned windowSize, unsigned minMatch,
+                          unsigned B, unsigned batchStart, unsigned windowSize,
                           unsigned totalPos,
                           unsigned* __restrict__ d_cand,
                           unsigned* __restrict__ d_nbCand)
@@ -271,28 +312,34 @@ __global__ void gpuSearch(const unsigned char* __restrict__ d_window, unsigned w
     __shared__ unsigned s_count[ZSTD_GPU_MAX_BATCH];
     if (threadIdx.x < B) s_count[threadIdx.x] = 0;
     __syncthreads();
+    /* The thread index is the in-batch position t, so the d_posHash/d_slot
+     * reads and the d_cand writes are sequential (coalesced). The row
+     * predecessor is a random d_sorted read (j = d_slot[t]); that is the
+     * rnd-data cost, but the coalesced d_cand writes matter more on periodic
+     * data, where every position is a candidate. */
     unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
     int isCand = 0;
     unsigned i = 0;
     if (t < totalPos) {
-        unsigned a, pib;
-        gpuBatchLocate(d_blockMeta, B, t, i, a, pib);
-        unsigned char const* const p = d_window + (a - winBase);
-        unsigned const h = gpuHash(p, hashLog, mls);
+        unsigned long long const packed = d_posHash[t];
+        unsigned const a = (unsigned)(packed >> 32);
+        unsigned const h = (unsigned)packed;
 
-        /* In-batch predecessor: the element just before t in the sorted array,
-         * if it has the same hash. Position 0 is a valid absolute position, so
-         * track validity separately. */
+        /* In-batch predecessor: the previous element of the row (j-1), if it
+         * is the same hash and a genuinely earlier position. The row is in
+         * position order up to rare cross-warp/block reordering, in which case
+         * the previous element is a later position and is rejected by the
+         * absPos test. Position 0 is a valid absolute position, so track
+         * validity separately. */
         unsigned q1 = 0; int hasQ1 = 0;
         {
             unsigned const j = d_slot[t];
             if (j > 0) {
-                unsigned long long const prev = d_keysSorted[j-1];
-                if ((unsigned)(prev >> posBits) == h) {
-                    unsigned const tPrev = (unsigned)(prev & ((1ull << posBits) - 1));
-                    unsigned iPrev, aPrev, pibPrev;
-                    gpuBatchLocate(d_blockMeta, B, tPrev, iPrev, aPrev, pibPrev);
-                    q1 = aPrev; hasQ1 = 1;
+                unsigned long long const prev = d_sorted[j - 1];
+                unsigned const prevAbs = (unsigned)(prev >> 32);
+                if ((unsigned)prev == h && prevAbs < a) {
+                    q1 = prevAbs;
+                    hasQ1 = 1;
                 }
             }
         }
@@ -314,16 +361,21 @@ __global__ void gpuSearch(const unsigned char* __restrict__ d_window, unsigned w
         }
         if (pass) {
             unsigned char const* const qp = d_window + (qc - winBase);
-            /* 8-byte prefilter (G12.1): two 64-bit loads at the candidate head.
-             * Valid positions always have 8 bytes left in the block (nValid =
-             * size-7), so the read stays inside the block. For the GPU levels
-             * minMatch <= 8, so a passing prefilter means the candidate is at
-             * least minMatch long; the capped length is ZSTD_GPU_MATCH_CAP and
-             * the greedy extends it. */
-            (void)minMatch;
-            pass = (gpuRead64(p) == gpuRead64(qp));
+            /* 8-byte prefilter (G12.1): two 64-bit loads at the candidate
+             * head. Valid positions always have 8 bytes left in the block
+             * (nValid = size-7), so the read stays inside the block. For the
+             * GPU levels minMatch <= 8, so a passing prefilter means the
+             * candidate is at least minMatch long; the capped length is
+             * ZSTD_GPU_MATCH_CAP and the greedy extends it. */
+            pass = (gpuRead64(d_window + (a - winBase)) == gpuRead64(qp));
         }
         if (pass) {
+            /* Frame-block index and position-within-block from the absolute
+             * position (the batch starts at batchStart, blocks are BLOCKSIZE
+             * apart, a power of two). */
+            unsigned const off = a - batchStart;
+            i = off >> 17;
+            unsigned const pib = off & (ZSTD_GPU_BLOCKSIZE - 1);
             unsigned* const c = d_cand + (i * ZSTD_GPU_BLOCKSIZE + pib) * 2;
             c[0] = a - qc;                    /* offset */
             c[1] = ZSTD_GPU_MATCH_CAP;        /* capped length (the greedy extends it) */
@@ -338,20 +390,18 @@ __global__ void gpuSearch(const unsigned char* __restrict__ d_window, unsigned w
 }
 
 /* Insert: update the persistent table with the batch's positions (the latest
- * position per fingerprint). Runs after the search so the search saw the
+ * position per fingerprint). Uses the gpuFillHist cache (d_posHash) - no
+ * re-hashing, no block-locate. Runs after the search so the search saw the
  * pre-batch table. */
-__global__ void gpuInsert(const unsigned char* __restrict__ d_window, unsigned winBase,
-                          const unsigned* __restrict__ d_blockMeta, unsigned B,
-                          unsigned hashLog, unsigned mls,
-                          unsigned totalPos,
+__global__ void gpuInsert(unsigned totalPos,
+                          const unsigned long long* __restrict__ d_posHash,
                           unsigned* __restrict__ d_table)
 {
     unsigned const t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= totalPos) return;
-    unsigned i, a, pib;
-    gpuBatchLocate(d_blockMeta, B, t, i, a, pib);
-    unsigned char const* const p = d_window + (a - winBase);
-    unsigned const h = gpuHash(p, hashLog, mls);
+    unsigned long long const packed = d_posHash[t];
+    unsigned const a = (unsigned)(packed >> 32);
+    unsigned const h = (unsigned)packed;
     atomicMax(d_table + h, a + 1);   /* store pos+1; a+1 is the latest so far */
 }
 
@@ -484,9 +534,10 @@ size_t ZSTD_estimateGpuMatchFinderMemory(
         size_t bytes = 0;
         bytes += (size_t)ZSTD_GPU_WINDOW_MAX + ZSTD_GPU_BLOCKSIZE;          /* window */
         bytes += (size_t)(1u << hashLog) * 4;                              /* table */
-        bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8 * 2;                   /* keyA/keyB */
+        bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8;                       /* keyA (row array) */
         bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 4;                       /* slot */
-        bytes += (size_t)B * 512 * 256 * 4 * 2;                            /* hist/startLocal */
+        bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8;                       /* posHash */
+        bytes += (size_t)(1u << hashLog) * 4 * 3;                          /* hist/rowStart/rowCounter */
         bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8;                       /* cand */
         bytes += (size_t)B * ZSTD_GPU_MAX_SEQS * 12;                       /* seq */
         bytes += (size_t)B * ZSTD_GPU_BLOCKSIZE * 8 * 2;                   /* pinned cand (x2) */
@@ -538,15 +589,6 @@ size_t ZSTD_createGpuMatchFinder(
         mf->B = 16;   /* default batch size (G11.2 makes this adaptive) */
         if (mf->B > ZSTD_GPU_MAX_BATCH) mf->B = ZSTD_GPU_MAX_BATCH;
 
-        /* posBits: bits needed for B*BLOCKSIZE positions. */
-        {
-            unsigned long long const maxPos = (unsigned long long)mf->B * ZSTD_GPU_BLOCKSIZE;
-            unsigned pb = 0; while ((1ull << pb) < maxPos) pb++;
-            mf->posBits = pb;
-        }
-        mf->nPasses = (mf->hashLog + 7) / 8;
-        mf->nBlocksMax = mf->B * (ZSTD_GPU_BLOCKSIZE / ZSTD_GPU_THREADS);
-
         /* ---- Device buffers ---- */
         /* The window buffer must hold the window (windowSize) plus the bytes of
          * the batches the GPU may still be computing. The chunk pipeline keeps
@@ -560,20 +602,25 @@ size_t ZSTD_createGpuMatchFinder(
         if (cudaMalloc(&mf->d_table, (size_t)(1u << mf->hashLog) * 4) != cudaSuccess) goto fail;
         if (cudaMemset(mf->d_table, 0, (size_t)(1u << mf->hashLog) * 4) != cudaSuccess) goto fail;
         {
-            size_t const kbytes = (size_t)mf->B * ZSTD_GPU_BLOCKSIZE * 8;
-            if (cudaMalloc(&mf->d_keyA, kbytes) != cudaSuccess) goto fail;
-            if (cudaMalloc(&mf->d_keyB, kbytes) != cudaSuccess) goto fail;
-        }
-        if (cudaMalloc(&mf->d_slot, (size_t)mf->B * ZSTD_GPU_BLOCKSIZE * 4) != cudaSuccess) goto fail;
-        {
-            size_t const hbytes = (size_t)mf->nBlocksMax * 256 * 4;
-            if (cudaMalloc(&mf->d_blockHist, hbytes) != cudaSuccess) goto fail;
-            if (cudaMalloc(&mf->d_blockStartLocal, hbytes) != cudaSuccess) goto fail;
-            size_t const gbytes = (size_t)((mf->nBlocksMax + 255) / 256) * 256 * 4;
-            if (cudaMalloc(&mf->d_groupTotal, gbytes) != cudaSuccess) goto fail;
-            if (cudaMalloc(&mf->d_groupPrefix, gbytes) != cudaSuccess) goto fail;
-            if (cudaMalloc(&mf->d_digitTotal, 256 * 4) != cudaSuccess) goto fail;
-            if (cudaMalloc(&mf->d_digitStart, 256 * 4) != cudaSuccess) goto fail;
+            /* Sort-free buffers (G6). d_keyA doubles as the 32-bit row array
+             * (d_sorted); d_keyB and the radix scratch buffers are no longer
+             * allocated (they stay NULL and the free path is NULL-checked). */
+            size_t const npos = (size_t)mf->B * ZSTD_GPU_BLOCKSIZE;   /* max valid positions per batch */
+            size_t const hsize = (size_t)(1u << mf->hashLog) * 4;     /* per-hash buffer */
+            if (cudaMalloc(&mf->d_keyA, npos * 8) != cudaSuccess) goto fail;
+            if (cudaMalloc(&mf->d_slot, npos * 4) != cudaSuccess) goto fail;
+            if (cudaMalloc(&mf->d_posHash, npos * 8) != cudaSuccess) goto fail;
+            if (cudaMalloc(&mf->d_hist, hsize) != cudaSuccess) goto fail;
+            if (cudaMalloc(&mf->d_rowStart, hsize) != cudaSuccess) goto fail;
+            if (cudaMalloc(&mf->d_rowCounter, hsize) != cudaSuccess) goto fail;
+            {
+                unsigned const nScanBlocks = (mf->hashLog > 10) ? (1u << (mf->hashLog - 10)) : 1u;
+                unsigned const nSubBlocks = (nScanBlocks > 1024) ? (nScanBlocks + 1023) / 1024 : 1u;
+                if (cudaMalloc(&mf->d_blockTotal, (size_t)nScanBlocks * 4) != cudaSuccess) goto fail;
+                if (cudaMalloc(&mf->d_blockPrefix, (size_t)nScanBlocks * 4) != cudaSuccess) goto fail;
+                if (cudaMalloc(&mf->d_subTotal, (size_t)nSubBlocks * 4) != cudaSuccess) goto fail;
+                if (cudaMalloc(&mf->d_subPrefix, (size_t)nSubBlocks * 4) != cudaSuccess) goto fail;
+            }
         }
         if (cudaMalloc(&mf->d_cand, (size_t)mf->B * ZSTD_GPU_BLOCKSIZE * 8) != cudaSuccess) goto fail;
         if (cudaMalloc(&mf->d_nbCand, (size_t)mf->B * 4) != cudaSuccess) goto fail;
@@ -644,7 +691,7 @@ static void gpuProfReport(const ZSTD_GpuMatchFinder* mf)
 {
     if (!mf->profile || mf->phaseCount == 0) return;
     static const char* const names[8] = {
-        "H2D", "fillKeys", "radix", "recordSlot",
+        "H2D", "fillHist", "rowScan", "scatter",
         "search", "insert", "greedy", "D2H"};
     double total = 0;
     for (int p = 0; p < 8; p++) total += mf->phaseMs[p];
@@ -675,12 +722,14 @@ size_t ZSTD_freeGpuMatchFinder(ZSTD_GpuMatchFinder* gpuMF)
     if (gpuMF->d_keyA) cudaFree(gpuMF->d_keyA);
     if (gpuMF->d_keyB) cudaFree(gpuMF->d_keyB);
     if (gpuMF->d_slot) cudaFree(gpuMF->d_slot);
-    if (gpuMF->d_blockHist) cudaFree(gpuMF->d_blockHist);
-    if (gpuMF->d_blockStartLocal) cudaFree(gpuMF->d_blockStartLocal);
-    if (gpuMF->d_groupTotal) cudaFree(gpuMF->d_groupTotal);
-    if (gpuMF->d_groupPrefix) cudaFree(gpuMF->d_groupPrefix);
-    if (gpuMF->d_digitTotal) cudaFree(gpuMF->d_digitTotal);
-    if (gpuMF->d_digitStart) cudaFree(gpuMF->d_digitStart);
+    if (gpuMF->d_posHash) cudaFree(gpuMF->d_posHash);
+    if (gpuMF->d_hist) cudaFree(gpuMF->d_hist);
+    if (gpuMF->d_rowStart) cudaFree(gpuMF->d_rowStart);
+    if (gpuMF->d_rowCounter) cudaFree(gpuMF->d_rowCounter);
+    if (gpuMF->d_blockTotal) cudaFree(gpuMF->d_blockTotal);
+    if (gpuMF->d_blockPrefix) cudaFree(gpuMF->d_blockPrefix);
+    if (gpuMF->d_subTotal) cudaFree(gpuMF->d_subTotal);
+    if (gpuMF->d_subPrefix) cudaFree(gpuMF->d_subPrefix);
     if (gpuMF->d_cand) cudaFree(gpuMF->d_cand);
     if (gpuMF->d_nbCand) cudaFree(gpuMF->d_nbCand);
     for (int b = 0; b < 2; b++) {
@@ -795,7 +844,7 @@ int ZSTD_gpuBatch_addBlock(ZSTD_GpuMatchFinder* gpuMF, void const* src, size_t s
 
 /* Submit the current batch to the GPU (asynchronous). Issues:
  *   copy stream  : [window memmove] + H2D append
- *   compute      : wait -> fillKeys -> radix -> slot -> search -> insert
+ *   compute      : wait -> fillHist -> rowScan -> scatter -> search -> insert
  *   copy stream  : wait -> D2H of the per-position candidates
  * The batch state is reset so the next batch can be staged. */
 /* G17 per-phase profiling helpers (no-ops unless ZSTD_GPU_PROFILE).
@@ -894,57 +943,59 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
                 unsigned const sz = gpuMF->batchSize[i];
                 totalPos += (sz >= 8) ? (sz - 7) : 0;
             }
-            unsigned const nBlocks = (totalPos + ZSTD_GPU_THREADS - 1) / ZSTD_GPU_THREADS;
-            unsigned const nGroups = (nBlocks + 255) / 256;
             unsigned const grid = (totalPos + ZSTD_GPU_THREADS - 1) / ZSTD_GPU_THREADS;
+            unsigned const nHist = 1u << gpuMF->hashLog;
+            unsigned const nScanBlocks = (nHist + 1023u) / 1024u;
+            unsigned const nSubBlocks = (nScanBlocks + 1023u) / 1024u;
 
+            /* Sort-free pipeline (G6): fill+hist -> row scan -> scatter ->
+             * search -> insert -> greedy. Replaces fillKeys -> 2-pass radix ->
+             * recordSlot. The row scan is a two-level exclusive prefix of the
+             * per-hash histogram (d_hist -> d_rowStart). */
             gpuProfRec(gpuMF, buf, 2, gpuMF->stream);
-            gpuFillKeys<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
+            if (cudaMemsetAsync(gpuMF->d_hist, 0, (size_t)nHist * 4, gpuMF->stream) != cudaSuccess)
+                return ERROR(GPU_cudaMemcpyFailed);
+            gpuFillHist<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
                 (unsigned*)gpuMF->d_blockMeta, count,
-                gpuMF->hashLog, gpuMF->mls, gpuMF->posBits,
-                (unsigned long long*)gpuMF->d_keyA, totalPos);
+                gpuMF->hashLog, gpuMF->mls,
+                (unsigned long long*)gpuMF->d_posHash,
+                (unsigned*)gpuMF->d_hist, totalPos);
             gpuProfRec(gpuMF, buf, 3, gpuMF->stream);
 
-            /* Radix passes over the hash bits (the low posBits bits are already
-             * in order). */
             gpuProfRec(gpuMF, buf, 4, gpuMF->stream);
-            {
-                unsigned long long* cur = (unsigned long long*)gpuMF->d_keyA;
-                unsigned long long* nxt = (unsigned long long*)gpuMF->d_keyB;
-                for (unsigned pass = 0; pass < gpuMF->nPasses; pass++) {
-                    unsigned const bitOffset = gpuMF->posBits + pass * 8;
-                    gpuRadixHist<<<nBlocks, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                        cur, bitOffset, totalPos, (unsigned*)gpuMF->d_blockHist);
-                    gpuRadixScanL1<<<nGroups, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                        (unsigned*)gpuMF->d_blockHist, nBlocks,
-                        (unsigned*)gpuMF->d_blockStartLocal, (unsigned*)gpuMF->d_groupTotal);
-                    gpuRadixScanL2<<<1, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                        (unsigned*)gpuMF->d_groupTotal, nGroups,
-                        (unsigned*)gpuMF->d_digitTotal, (unsigned*)gpuMF->d_digitStart,
-                        (unsigned*)gpuMF->d_groupPrefix);
-                    gpuRadixScatter<<<nBlocks, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                        cur, bitOffset, totalPos,
-                        (unsigned*)gpuMF->d_digitStart, (unsigned*)gpuMF->d_groupPrefix,
-                        (unsigned*)gpuMF->d_blockStartLocal,
-                        nxt);
-                    /* Swap. */
-                    { unsigned long long* tmp = cur; cur = nxt; nxt = tmp; }
-                }
-                /* After an even number of passes the result is in d_keyA; after
-                 * an odd number it is in d_keyB. Copy to d_keyA if needed. */
-                if (cur != (unsigned long long*)gpuMF->d_keyA) {
-                    if (cudaMemcpyAsync(gpuMF->d_keyA, cur, (size_t)totalPos * 8,
-                                        cudaMemcpyDeviceToDevice, gpuMF->stream) != cudaSuccess)
-                        return ERROR(GPU_cudaMemcpyFailed);
-                }
+            gpuRowScanBlock<<<nScanBlocks, 1024, 0, gpuMF->stream>>>(
+                (unsigned*)gpuMF->d_hist, nHist,
+                (unsigned*)gpuMF->d_rowStart, (unsigned*)gpuMF->d_blockTotal);
+            if (nScanBlocks <= 1024) {
+                gpuRowScanGlobalSmall<<<1, 1024, 0, gpuMF->stream>>>(
+                    (unsigned*)gpuMF->d_blockTotal, nScanBlocks,
+                    (unsigned*)gpuMF->d_blockPrefix);
+            } else {
+                gpuRowScanSubBlock<<<nSubBlocks, 1024, 0, gpuMF->stream>>>(
+                    (unsigned*)gpuMF->d_blockTotal, nScanBlocks,
+                    (unsigned*)gpuMF->d_blockPrefix, (unsigned*)gpuMF->d_subTotal);
+                gpuRowScanSubGlobal<<<1, 1024, 0, gpuMF->stream>>>(
+                    (unsigned*)gpuMF->d_subTotal, nSubBlocks,
+                    (unsigned*)gpuMF->d_subPrefix);
+                gpuRowScanCombine<<<nSubBlocks, 1024, 0, gpuMF->stream>>>(
+                    nScanBlocks, (unsigned*)gpuMF->d_subPrefix,
+                    (unsigned*)gpuMF->d_blockPrefix);
             }
-
+            gpuRowScanAdd<<<nScanBlocks, 1024, 0, gpuMF->stream>>>(
+                nHist, (unsigned*)gpuMF->d_blockPrefix,
+                (unsigned*)gpuMF->d_rowStart);
             gpuProfRec(gpuMF, buf, 5, gpuMF->stream);
-            gpuProfRec(gpuMF, buf, 6, gpuMF->stream);   /* recordSlot start */
-            gpuRecordSlot<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                (unsigned long long*)gpuMF->d_keyA, gpuMF->posBits, totalPos,
-                (unsigned*)gpuMF->d_slot);
+
+            /* Scatter the positions into their hash rows (records d_slot). */
+            gpuProfRec(gpuMF, buf, 6, gpuMF->stream);
+            if (cudaMemsetAsync(gpuMF->d_rowCounter, 0, (size_t)nHist * 4, gpuMF->stream) != cudaSuccess)
+                return ERROR(GPU_cudaMemcpyFailed);
+            gpuScatter<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
+                totalPos,
+                (unsigned long long*)gpuMF->d_posHash, (unsigned*)gpuMF->d_rowStart,
+                (unsigned*)gpuMF->d_rowCounter,
+                (unsigned long long*)gpuMF->d_keyA, (unsigned*)gpuMF->d_slot);
             gpuProfRec(gpuMF, buf, 7, gpuMF->stream);
 
             /* Clear the batch's candidate slots before the search. The search
@@ -959,19 +1010,18 @@ size_t ZSTD_gpuBatch_submit(ZSTD_GpuMatchFinder* gpuMF)
             gpuProfRec(gpuMF, buf, 8, gpuMF->stream);
             gpuSearch<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
                 (unsigned char*)gpuMF->d_window, gpuMF->winBase,
-                (unsigned*)gpuMF->d_blockMeta, count,
-                (unsigned long long*)gpuMF->d_keyA, (unsigned*)gpuMF->d_slot,
+                (unsigned long long*)gpuMF->d_posHash,
+                (unsigned long long*)gpuMF->d_keyA,
+                (unsigned*)gpuMF->d_slot,
                 (unsigned*)gpuMF->d_table,
-                gpuMF->hashLog, gpuMF->mls, gpuMF->posBits,
-                gpuMF->windowSize, gpuMF->minMatch, totalPos,
+                count, gpuMF->framePos, gpuMF->windowSize, totalPos,
                 (unsigned*)gpuMF->d_cand, (unsigned*)gpuMF->d_nbCand);
             gpuProfRec(gpuMF, buf, 9, gpuMF->stream);   /* search end */
 
             gpuProfRec(gpuMF, buf, 10, gpuMF->stream);   /* insert start */
             gpuInsert<<<grid, ZSTD_GPU_THREADS, 0, gpuMF->stream>>>(
-                (unsigned char*)gpuMF->d_window, gpuMF->winBase,
-                (unsigned*)gpuMF->d_blockMeta, count,
-                gpuMF->hashLog, gpuMF->mls, totalPos,
+                totalPos,
+                (unsigned long long*)gpuMF->d_posHash,
                 (unsigned*)gpuMF->d_table);
             gpuProfRec(gpuMF, buf, 11, gpuMF->stream);   /* insert end */
 
