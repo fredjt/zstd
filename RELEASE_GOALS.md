@@ -604,4 +604,51 @@ the per-block end-to-end (host overhead + H2D/D2H + the CLI's 4-block batches
 dominate); the per-block GPU time is the G6 floor and is what this change
 targets. The remaining rep gap is the greedy (0.215 ms/batch on rep, vs
 0.003 on rnd) - a cheaper long-match greedy is the next step to GPU >= CPU on
-rep.
+rep: **done (G22)**.
+
+**G22 : the cheaper long-match greedy (2026-11-22, RTX 3060, L1, -T1).** The
+device greedy's match extension was the data-dependent cost : on rep (a 57-byte
+period) it extends one ~131 KB match per block, and the old single-warp walk
+(32 lanes x 8 B = 256 B/round, ~512 rounds) paid a dependent load-latency chain
+- each round waited on the previous round's coalesced loads before it could
+ballot. The extension now uses the whole 256-thread CUDA block (256 x 8 B = 2
+KB/round, ~64 rounds for a whole-block match) and pipelines the rounds : the
+next round's loads are issued before the current round's ballots are aggregated,
+so two rounds are in flight and the chain is broken. The first mismatch is a
+block-wide concept (the smallest differing byte) but __ballot_sync is per-warp,
+so each warp records its ballot in shared memory and the block scans the 8
+ballots for the first non-zero warp, then the first lane within it; that thread
+byte-scans its 8-byte chunk to the exact position. The tail (< 2 KB) is checked
+cooperatively in one round with range checks (the last thread may be partially
+or fully out of range and is treated as "equal").
+
+Per-batch phase times (B=16, 3060 shared with a llama-server - compare
+before/after on the same GPU):
+
+| phase  | rep before | rep after | rnd before | rnd after |
+| ------ | ---------- | --------- | ---------- | --------- |
+| greedy | 0.2199     | 0.059     | 0.0033     | 0.0041    |
+
+**The rep greedy is 3.7x cheaper (0.220 -> 0.059 ms/batch) and is now 12% of
+the batch (was 35%). The rep per-block GPU time is 0.0396 -> 0.0301 ms (1.32x).
+rnd is unchanged (0.0033 -> 0.0041 ms - rnd has no long matches, so the greedy
+was already trivial).** End-to-end on 1 GB (CLI, L1, -T1, 3060): rep 1.89 ->
+1.56 s (1.21x, 540 -> 658 MiB/s); rnd ~2.0 s (unchanged, within the shared-GPU
+noise). The greedy was the only data-dependent phase, so the win is on rep
+(where the CPU is trivially fast and the GPU lost) - exactly the G6 gap.
+
+Correctness: the greedy produces the same sequences as the old greedy for the
+same candidate set (verified with a standalone old-vs-new-vs-reference test
+over 6 seeds, ~5100 sequences each, all identical to a byte-by-byte reference
+extension); the G5 suite passes; 16 MB rep/rnd roundtrip byte-identical. The
+compression ratio is unchanged (the extension finds the same first mismatch).
+Note the per-block output is still non-deterministic across runs, but that is
+the pre-existing scatter atomicAdd order (G21 caveat #1), not the greedy : the
+old code is non-deterministic too (rep16 2121-2358 B across runs).
+
+The remaining rep gap (GPU 0.0301 vs CPU 0.0205 ms/block) is now the
+data-independent phases (H2D 0.058 + fillHist 0.110 + rowScan 0.014 + scatter
+0.105 + search 0.077 + insert 0.054 + D2H 0.007 = 0.425 ms/batch = 0.0265
+ms/block), which is above the CPU's 0.0205 ms/block even with a zero-cost
+greedy. Closing it needs cheaper fillHist/scatter/search (the per-position
+work), not the greedy.
